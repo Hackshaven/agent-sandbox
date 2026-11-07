@@ -30,7 +30,7 @@ Docker still has a job: rootless Docker runs local targets *inside* the sandbox 
 | No internet; egress enforced outside the guest | Private switch, no default route or DNS in the sandbox, nftables on the gateway drops and logs everything except `10.77.0.10 → 10.77.0.1:8080` | `gateway-setup.sh`, `sandbox-setup.sh cutover` |
 | Proxy forwards model calls only | Exact-match allowlist (`POST /v1/messages`, `/v1/messages/count_tokens`); everything else 403; client auth headers stripped | `gateway-setup.sh` |
 | No cloud metadata reachable | Not on a cloud host; the gateway refuses to route | `gateway-setup.sh` |
-| Turn and time limit on every run | `--max-turns` and `timeout`, validated before launch; unreadable limits refuse to start | `agentlab-run` |
+| Turn and time limit on every run | `--max-turns` and `timeout`, validated before launch; unreadable limits refuse to start, and so does a zero time limit, which `timeout` reads as none | `agentlab-run`, `agentlab.ps1 run` |
 | No privileged mode or added capabilities | Agent has no sudo and isn't in `docker`, `adm` or `lxd`; Docker is rootless | `sandbox-setup.sh install` |
 | Orchestrator and transcripts on the trusted side | Runs launch from the gateway; transcripts and logs are written there | `agentlab-run` |
 | Auto mode as defense in depth, never `bypassPermissions` | Managed settings set `defaultMode: auto` and disable bypass; environment and tampering rules describe the lab; the No-network rule is added only after checks pass | `sandbox-setup.sh install`, `finalize` |

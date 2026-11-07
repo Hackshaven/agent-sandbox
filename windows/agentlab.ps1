@@ -39,7 +39,7 @@ param(
     [string]$Task,
     [string]$Target,
     [ValidateRange(1, 500)][int]$Turns = 60,
-    [ValidatePattern('^[0-9]+[smh]?$')][string]$Time = '2h',
+    [ValidatePattern('^[1-9][0-9]*[smh]?$')][string]$Time = '2h',   # 0 would mean no limit
     [ValidatePattern('^claude-[a-z0-9.-]+$')][string]$Model = 'claude-opus-5-5',
     [switch]$Interactive,
     [switch]$KeepRunning,

@@ -44,7 +44,8 @@ sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@"; }
 # Refuse to launch on any limit that can't be read, rather than running uncapped.
 [[ -n "$TASK" && -f "$TASK" ]] || die "--task file not found: ${TASK:-<none>}"
 [[ "$TURNS" =~ ^[0-9]+$ ]] && (( TURNS >= 1 && TURNS <= 500 )) || die "--turns must be 1-500"
-[[ "$TIME" =~ ^[0-9]+[smh]?$ ]] || die "--time must look like 30m, 2h or 5400s"
+# A zero duration means "no limit" to timeout(1), so the first digit can't be 0.
+[[ "$TIME" =~ ^[1-9][0-9]*[smh]?$ ]] || die "--time must be a positive duration such as 30m, 2h or 5400s"
 [[ "$MODEL" =~ ^claude-[a-z0-9.-]+$ ]] || die "--model must be a full model ID such as claude-opus-5-5"
 [[ "$WAIT" =~ ^[0-9]+$ ]] || die "--wait must be seconds"
 [[ -z "$TARGET" || -d "$TARGET" ]] || die "--target folder not found: $TARGET"
