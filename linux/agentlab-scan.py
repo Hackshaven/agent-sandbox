@@ -10,13 +10,15 @@ memory, never unpacked.
 Decodes every tool call, applies rules written for this lab (a sandbox VM whose
 only allowed destination is the credential proxy), flags any record of a run
 outside auto mode, and prints each hit with the file, line, rule and a snippet.
-Exit status: 0 no hits, 2 hits, 1 error.
+Exit status: 0 no hits, 2 hits, 3 part of an archive wasn't scanned (a cap or
+an error stopped it; read what it lists by hand), 1 error.
 
 A hit means "read this part of the transcript", not "something went wrong".
 Vulnerability research routinely trips some of these rules. Rules only catch
 what someone anticipated, so also read a random sample of runs with no hits.
 """
 import gzip
+import hashlib
 import json
 import os
 import posixpath
@@ -211,8 +213,10 @@ MAX_STREAM_BYTES = 4 * 1024 * 1024 * 1024    # the whole decompressed archive: h
                                              # skipped members and rereads included
 MAX_READ = 1024 * 1024                  # one read tarfile asks for
 MAX_HEADER = 1024 * 1024                # one member's headers, PAX and long names included
-MAX_MEMBERS = 10000
-MAX_NAME = 4096                         # longest member name kept for hard-link lookups
+MAX_MEMBERS = 10000                     # members scanned; later ones are listed, not scanned
+MAX_LISTED = 100000                     # members read past a stop, to list what wasn't scanned
+MAX_NAME = 4096                         # longest member name kept as it is
+INCOMPLETE = "scan-incomplete"          # the rule for every finding that a scan stopped early
 
 
 class Stop:
@@ -295,7 +299,8 @@ def read_lines(f, limit=None, budget=None):
         budget["left"] -= len(raw)
         if budget["left"] < 0:
             budget["stopped"] = True
-            return Stop(f"passed {MAX_ARCHIVE_BYTES} bytes of transcripts; stopped")
+            return Stop(f"the archive's {MAX_ARCHIVE_BYTES}-byte transcript budget ran out here, "
+                        "so the rest of this transcript and of the archive went unscanned")
         return None
 
     def readline():
@@ -305,7 +310,8 @@ def read_lines(f, limit=None, budget=None):
             return f.readline(limit + 1)
         except Exception as e:  # the stream's caps, or zlib and tar errors mid-member
             budget["stopped"] = True
-            return Stop(f"{type(e).__name__}: {e}; stopped")
+            return Stop(f"{type(e).__name__}: {e}: the rest of this transcript and of the "
+                        "archive went unscanned")
 
     while True:
         raw = readline()
@@ -346,7 +352,7 @@ def scan_lines(lines):
             hits.append((lineno, "unreadable-line", "line", f"longer than {MAX_LINE} bytes"))
             continue
         if isinstance(raw, Stop):
-            hits.append((lineno, "unreadable-archive", "archive", raw.reason))
+            hits.append((lineno, INCOMPLETE, "archive", raw.reason))
             break
         if isinstance(raw, bytes):
             try:
@@ -354,7 +360,8 @@ def scan_lines(lines):
             except UnicodeDecodeError:
                 # Claude Code writes UTF-8, so a bad byte is worth reading by hand.
                 # Scan what can be read anyway.
-                hits.append((lineno, "unreadable-line", "line", "not valid UTF-8"))
+                hits.append((lineno, "unreadable-line", "line",
+                             "not valid UTF-8, so the rules may miss text the bad bytes split"))
                 raw = raw.decode("utf-8", errors="replace")
         if not raw.strip():
             continue
@@ -383,15 +390,36 @@ def finding(kind, label, text):
     return [(0, kind, label, text)], 0, 0, 0
 
 
+def name_key(name):
+    """A member name as a lookup key: as it is, or its digest when it's long."""
+    name = posixpath.normpath(name)
+    if len(name) <= MAX_NAME:
+        return name
+    return hashlib.sha256(name.encode("utf-8", "surrogateescape")).digest()
+
+
+def data_of(member):
+    """What extractfile needs to read a regular member again, without its headers."""
+    t = tarfile.TarInfo(member.name[:MAX_NAME])
+    t.type = tarfile.REGTYPE
+    t.size, t.offset, t.offset_data, t.sparse = member.size, member.offset, member.offset_data, member.sparse
+    return t
+
+
 def scan_archive(path):
     """Yield (label, result) for each .jsonl file in a tar archive, read in memory and
     never unpacked. The sandbox chose what's in it, so the decompressed stream,
-    each read, members, sizes and transcript bytes are capped, tarfile is never
-    asked to load the whole member list, and anything that isn't a readable
-    transcript is reported."""
+    each read, members, sizes and transcript bytes are capped, and tarfile is never
+    asked to load the whole member list. Each file's data is scanned once however
+    many hard links name it. When a cap or an error stops the scan, the transcripts
+    it didn't reach are listed under scan-incomplete, so a decoy placed first can
+    use up a cap but can't hide what comes after it."""
     budget = {"left": MAX_ARCHIVE_BYTES}
     found = 0
-    regular = {}   # name -> member, for hard links, which point back at an earlier file
+    regular = {}   # name key -> data, for hard links, which point back at an earlier file
+    scanned = {}   # name key of data scanned -> the label it was scanned under
+    stop = None    # why scanning stopped, if it did
+    unscanned, names = 0, []
     try:
         with open(path, "rb") as raw:
             gz = raw.read(2) == b"\x1f\x8b"
@@ -405,38 +433,58 @@ def scan_archive(path):
                     break
                 tar.members.clear()   # tarfile keeps every member it reads; these are kept here
                 count += 1
-                if count > MAX_MEMBERS:
-                    yield path, finding("unreadable-archive", "archive", f"more than {MAX_MEMBERS} members; stopped")
-                    return
-                if member.isfile() and len(member.name) <= MAX_NAME:
-                    member.pax_headers = {}
-                    regular[posixpath.normpath(member.name)] = member
+                if stop is None and count > MAX_MEMBERS:
+                    stop = f"more than {MAX_MEMBERS} members"
+                if count > MAX_MEMBERS + MAX_LISTED:
+                    stop += f", and the archive goes on past {MAX_MEMBERS + MAX_LISTED} members"
+                    break
+                if member.isfile():
+                    regular[name_key(member.name)] = data_of(member)
                 if not member.name.endswith(".jsonl"):
                     continue
                 found += 1
+                if stop is not None:   # list it, don't scan it
+                    unscanned += 1
+                    if len(names) < 20:
+                        names.append(member.name[:200])
+                    continue
                 label = f"{path}:{member.name}"
-                data = member
-                if member.islnk():   # read the file it links to
-                    data = regular.get(posixpath.normpath(member.linkname))
+                if member.islnk():   # read the file it links to, once
+                    key = name_key(member.linkname)
+                    data = regular.get(key)
                     if data is None:
                         yield label, finding("unreadable-line", "member", "a hard link to no file before it")
                         continue
-                elif not member.isfile():
+                    if key in scanned:
+                        yield label, finding("linked-member", "member",
+                                             f"a hard link to data already scanned as {scanned[key]}")
+                        continue
+                elif member.isfile():
+                    key, data = name_key(member.name), regular[name_key(member.name)]
+                else:
                     yield label, finding("unreadable-line", "member", "not a regular file (a link or device)")
                     continue
                 if data.size > MAX_MEMBER:
                     yield label, finding("unreadable-line", "member", f"{data.size} bytes, over the cap")
                     continue
+                scanned[key] = label
                 yield label, scan_lines(read_lines(tar.extractfile(data), budget=budget))
                 if budget.get("stopped"):
-                    return
-    except StreamCap as e:
-        yield path, finding("unreadable-archive", "archive", f"{e}; stopped")
-        return
-    except Exception as e:  # zlib, tar header and other errors in data the sandbox wrote
-        yield path, finding("unreadable-archive", "archive", f"{type(e).__name__}: {e}")
-        return
-    if not found:
+                    stop = "the transcript budget ran out, or a read failed (see above)"
+    except Exception as e:  # the stream's caps, zlib, tar header and other errors in data the sandbox wrote
+        reason = f"{type(e).__name__}: {e}" if not isinstance(e, StreamCap) else str(e)
+        stop = f"{stop}; then {reason}" if stop else reason
+        unscanned_note = "the rest of the archive couldn't be read"
+    else:
+        unscanned_note = None
+    if stop is not None:
+        what = f"{unscanned} more transcripts went unscanned" if unscanned else "no later transcripts were found"
+        if names:
+            what += ": " + ", ".join(names) + (", ..." if unscanned > len(names) else "")
+        if unscanned_note:
+            what += f"; {unscanned_note}"
+        yield path, finding(INCOMPLETE, "archive", f"stopped ({stop}); {what}. Read them by hand")
+    elif not found:
         yield path, finding("unreadable-archive", "archive", "holds no .jsonl transcripts")
 
 
@@ -474,14 +522,17 @@ def main(argv):
         except OSError as e:
             print(printable(f"{path}: {e}"), file=sys.stderr)
             return 1
-    # Files with hits first, so a review that shows only the top of this list sees
-    # them however many quiet transcripts the sandbox kept.
-    found.sort(key=lambda item: not item[1][0])
+    # A stopped scan first, then files with hits, so a review that shows only the
+    # top of this list sees both however many quiet transcripts the sandbox kept.
+    incomplete = [label for label, r in found if any(h[1] == INCOMPLETE for h in r[0])]
+    found.sort(key=lambda item: (item[0] not in incomplete, not item[1][0]))
     for label, (hits, denials, unavailable, calls) in found:
         print(printable(f"{label}: {calls} tool calls, {len(hits)} hits, {denials} auto mode "
                         f"denials, {unavailable} classifier-unavailable"))
         for lineno, name, kind, snip in hits:
             print(printable(f"  line {lineno:<6} [{name}] {kind}: {snip}"))
+    if incomplete:
+        return 3
     return 2 if any(r[0] for _, r in found) else 0
 
 

@@ -23,7 +23,10 @@ UTF-8), 8 nothing arrived for --stall seconds.
 
 With --session, the watcher agentlab-run starts on the sandbox sends a
 heartbeat line every second, which is skipped (not copied to --out), so with
---stall a watcher that freezes stops the run as surely as one that exits.
+--stall a watcher that freezes stops the run too. The agent runs that watcher
+and could forge heartbeats, as it could forge any line. The watcher sends only
+finished records, so a line cut off by the end of the feed (the gateway or the
+connection ending it) is kept in --out but not read, and doesn't stop the run.
 
 The monitor reads input the agent can shape, and with --session a file the
 agent can write, so a record it can't parse never ends its loop: the raw bytes
@@ -39,6 +42,7 @@ import json
 import re
 import signal
 import sys
+import time
 
 DEFAULT_DENY = (r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|"
                 r"auto[- ]mode (has )?(denied|blocked)|"
@@ -116,7 +120,9 @@ def classifier_denied(msg):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", required=True, help="file to append the raw input to, byte for byte")
+    ap.add_argument("--out", required=True,
+                    help="file to append the raw input to, byte for byte (with --session, "
+                         "less the watcher's heartbeats)")
     ap.add_argument("--max-consecutive-denials", type=int, default=3)
     ap.add_argument("--max-denials", type=int, default=20)
     ap.add_argument("--deny-pattern", default=DEFAULT_DENY)
@@ -146,7 +152,7 @@ def main():
     def show(msg):
         text = printable(msg)
         if log:
-            log.write(text + "\n")
+            log.write(time.strftime("%Y-%m-%dT%H:%M:%S%z ") + text + "\n")
             log.flush()
         elif not args.quiet:
             print(text, flush=True)
@@ -250,17 +256,26 @@ def main():
         signal.signal(signal.SIGALRM, on_alarm)
     total = 0
     lineno = 0
+    heard = {"record": None, "heartbeat": None}   # when each last arrived
+
+    def when(t):
+        return time.strftime("%H:%M:%S", time.localtime(t)) if t else "never"
+
     with open(args.out, "ab") as out:
         while True:
             try:
                 raw = next_line()
             except Stalled:
-                show(f"  ! STOP: nothing arrived for {args.stall} seconds, so nothing is watching")
+                show(f"  ! STOP: no complete line for {args.stall} seconds, so nothing is watching "
+                     f"(last record {when(heard['record'])}, last heartbeat {when(heard['heartbeat'])}, "
+                     f"{lineno} records)")
                 return 8
             if not raw:
                 break
             if args.session and raw == HEARTBEAT:
+                heard["heartbeat"] = time.time()
                 continue
+            heard["record"] = time.time()
             out.write(raw)
             out.flush()
             lineno += 1
@@ -271,6 +286,9 @@ def main():
             if len(raw) > args.max_line_bytes:
                 show(f"  ! STOP: line {lineno} is longer than {args.max_line_bytes} bytes")
                 return 7
+            if args.session and not raw.endswith(b"\n"):
+                show(f"  (line {lineno} was cut off when the feed ended; kept in --out, not read)")
+                break
             try:
                 # Claude Code writes UTF-8. In a session file the agent can write,
                 # a bad byte inside a JSON string would otherwise parse.

@@ -178,8 +178,12 @@ collect() {
 # one while its file lives, so a file the agent adds can add lines but can't hide
 # any. It is the feed's only writer and sends each record whole, so records from
 # two transcripts can't mix, plus a heartbeat every second. It exits, and so ends
-# the gateway's view, if no transcript appears within five minutes, if a followed
-# file is deleted, replaced or truncated, or if a new one isn't a regular file.
+# the gateway's view: 2 if the session never wrote its PID, 5 if a followed file
+# is deleted, replaced, truncated or holds a heartbeat line, or a new one isn't a
+# regular file, 6 if no transcript appears within five minutes, 7 past 256
+# transcripts, 0 once the session has ended and every finished record is sent. A
+# record still unfinished then (a time-limit kill mid-write) isn't sent; its file
+# and size go to watch.log, and the copy in claude-projects.tgz is scanned.
 # Everything on that side runs as agent, so the gateway treats any early end of
 # the watcher, or WATCH_STALL seconds with nothing from it, as a lost watcher and
 # ends the session itself: a tripwire that fails closed, not a control the agent
@@ -206,8 +210,9 @@ def send(data):
         view = view[os.write(1, view):]
 
 
-def say(text):
-    os.write(2, (text + "\n").encode("utf-8", "backslashreplace"))
+def say(text):   # to watch.log; paths go through ascii(), so no name can add a line
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    os.write(2, ("%s %s\n" % (stamp, text)).encode("ascii", "backslashreplace"))
 
 
 def leave(code, why):
@@ -244,7 +249,7 @@ def discover():
             if st.st_mtime <= T0:
                 continue
             if not stat.S_ISREG(st.st_mode):
-                leave(5, "%s isn't a regular file" % e.path)
+                leave(5, "%s isn't a regular file" % ascii(e.path))
             if len(followed) >= MAX_FILES:
                 leave(7, "more than %d transcripts" % MAX_FILES)
             try:
@@ -256,10 +261,17 @@ def discover():
                 os.close(fd)
                 continue
             followed[e.path] = [fd, (st.st_dev, st.st_ino), 0, bytearray()]
-            say("following " + e.path)
+            say("following %s" % ascii(e.path))
 
 
-def read_new(entry):
+def forward(path, block):
+    """Send finished lines, unless one is a heartbeat, which only this watcher sends."""
+    if (b"\n" + block).find(b"\n" + HEARTBEAT) >= 0:
+        leave(5, "%s holds a heartbeat line" % ascii(path))
+    send(block)
+
+
+def read_new(path, entry):
     """Send each line finished since the last read, whole."""
     fd, _, _, line = entry
     while True:
@@ -270,7 +282,7 @@ def read_new(entry):
         line += chunk
         end = line.rfind(b"\n") + 1
         if end:
-            send(line[:end])
+            forward(path, bytes(line[:end]))
             del line[:end]
         if len(line) > MAX_LINE:   # the monitor stops on a line this long, so pass it on
             send(line)
@@ -281,11 +293,11 @@ def check(path, entry):
     try:
         st = os.stat(path, follow_symlinks=False)
     except OSError:
-        leave(5, "%s was deleted" % path)
+        leave(5, "%s was deleted" % ascii(path))
     if (st.st_dev, st.st_ino) != entry[1]:
-        leave(5, "%s was replaced" % path)
+        leave(5, "%s was replaced" % ascii(path))
     if os.fstat(entry[0]).st_size < entry[2]:
-        leave(5, "%s was truncated" % path)
+        leave(5, "%s was truncated" % ascii(path))
 
 
 def main():
@@ -310,17 +322,18 @@ def main():
     while running(pid):
         discover()
         for path, entry in list(followed.items()):
-            read_new(entry)   # what the file holds, then whether it's still the same file
+            read_new(path, entry)   # what the file holds, then whether it's still the same file
             check(path, entry)
         if not followed and time.monotonic() - started > 300:
             leave(6, "no transcript appeared within five minutes")
         send(HEARTBEAT)
         time.sleep(1)
     discover()   # the session has ended: send what's left, once
-    for entry in followed.values():
-        read_new(entry)
+    for path, entry in followed.items():
+        read_new(path, entry)
         if entry[3]:
-            send(bytes(entry[3]) + b"\n")
+            say("%s ends partway through a record (%d bytes), not sent" % (ascii(path), len(entry[3])))
+    say("the session has ended")
 
 
 try:
@@ -344,7 +357,9 @@ end_session() {   # end_session REASON: stop the interactive session from the ga
   wait "$sr" 2>/dev/null || true
 }
 kill_feed() {   # end the watcher's ssh (its timeout passes the signal on), if it's still up
-  [[ -s "$WATCH_FEED" ]] && kill "$(cat "$WATCH_FEED")" 2>/dev/null
+  if [[ -s "$WATCH_FEED" ]] && kill "$(cat "$WATCH_FEED")" 2>/dev/null; then
+    echo "watch_feed_killed=1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  fi
   return 0
 }
 watch_session() {   # runs in the background for the length of an interactive session
@@ -363,7 +378,7 @@ watch_session() {   # runs in the background for the length of an interactive se
   echo "watch_exit=$mrc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
   kill_feed   # nothing reads it now
   case $mrc in
-    3|4|7|8) end_session "the monitor stopped it (exit $mrc)" ;;
+    3|4|7|8) [[ -e "$SESSION_FLAG" ]] && end_session "the monitor stopped it (exit $mrc)" ;;
     *) # The watcher stopped reading. If the session is still up, nothing is watching it.
        for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || break; sleep 1; done
        [[ -e "$SESSION_FLAG" ]] && end_session "the watcher ended (exit $mrc) while the session ran" ;;
@@ -476,6 +491,7 @@ if (( ${#transcripts[@]} )); then
   case $scan_rc in
     0) ;;
     2) note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt" ;;
+    3) note "The scan stopped partway through an archive; read the transcripts it lists by hand. Full list: $RUN_DIR/scan.txt" ;;
     *) note "The scan didn't finish (exit $scan_rc), so read the transcripts by hand." ;;
   esac
 fi

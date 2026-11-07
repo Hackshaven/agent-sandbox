@@ -125,27 +125,43 @@ Add `-Interactive` for a supervised session instead. It's recorded on the gatewa
 and `agentlab-monitor` follows its transcript and ends the session if a prompt is
 sent outside auto mode (switching to plan or accept-edits mode ends it too), the
 denial budget runs out, the transcript holds a line the monitor won't trust, or
-the watcher stops reading or goes quiet for 30 seconds while the session runs. It
-follows the new transcript `/clear` starts. The watcher runs as the agent on the
-sandbox, so treat it as a tripwire, not a guard: keep watching the session.
+the watcher ends, or sends nothing (not even its once-a-second heartbeat) for 30
+seconds, while the session runs. It follows the new transcript `/clear` starts.
+The watcher runs as the agent on the sandbox, so treat it as a tripwire, not a
+guard: keep watching the session.
 
 Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
 (headless) or `session.log`, `session-transcript.jsonl`, `session-monitor.log` and
 `watch.log` (interactive), `claude-projects.tgz`, `credproxy.new.log`,
-`egress-deny.new.log` and `scan.txt`. `meta.txt` records how the run ended:
-`remote_exit` and `monitor_exit` for a headless run; `session_exit`,
-`watch_exit`, any `watch_stop` reason, `watch_unfinished` if the watcher was
-still reading 10 seconds after the session ended and, when the watcher's ssh has
-ended, `watch_remote_exit` for an interactive one; `interrupted` after Ctrl+C, a closed
-window or a TERM; and `projects_tgz_exit` for the evidence pull. The run's exit
-code says how it ended: 0 finished, 3 not in auto mode, 4 denial budget spent,
-5 no init message, 6 auto mode not confirmed, 7 a transcript line the monitor
-won't trust, 8 the watcher was lost or went quiet, 124 or 137 the time limit, 129, 130 or 143
-interrupted.
+`egress-deny.new.log` and `scan.txt`. `meta.txt` records how the run ended; its
+lines can land out of order, so go by their `at=` times. A headless run records
+`remote_exit` and `monitor_exit`. An interactive one records:
+
+- `session_exit`, and `watch_exit`, the monitor's exit code
+- `watch_stop` if the gateway ended the session, and why
+- `watch_remote_exit`, the watcher's own exit code: 2, 5, 6 or 7 as the comment
+  above `WATCH_REMOTE` in `agentlab-run` lists them, 255 if its connection dropped
+  or was cut, or 124 or 137 at the gateway's deadline. `watch.log` says why, with
+  times
+- `watch_feed_killed` if the gateway cut the watcher's connection
+- `watch_unfinished` if the watcher was given 10 seconds, once the agent was
+  stopped, and hadn't finished
+
+Any run can record `interrupted` after Ctrl+C, a closed window or a TERM, and
+`projects_tgz_exit` for the evidence pull.
+
+The run's exit code says how it ended: 0 finished, 3 not in auto mode, 4 denial
+budget spent, 5 no init message, 6 auto mode not confirmed, 7 a transcript line
+the monitor won't trust, 8 the watcher ended, went quiet or hadn't finished,
+124 or 137 the time limit, 129, 130 or 143 interrupted. In an interactive run, a
+code from the watcher takes the place of the session's own, 124 and 137
+included.
+
 Folders older than 45 days are pruned. The files are kept byte for byte,
-including whatever the agent wrote, so read them with `less` (not `less -R`) or
-`cat -v`, never plain `cat` or `tail -f`, and don't paste into an admin console
-after reading `session.log`.
+including whatever the agent wrote (the gateway's copy of a session transcript
+leaves out the watcher's heartbeats), so read them with `less` (not `less -R`)
+or `cat -v`, never plain `cat` or `tail -f`, and don't paste into an admin
+console after reading `session.log`.
 
 ## When something changes
 

@@ -109,6 +109,8 @@ case "$CASE" in
   normal) while kill -0 "$SESS" 2>/dev/null; do beat; sleep 0.2; done ;;
   quiet) sleep 30 ;;                                   # connected, but silent
   wedge) while :; do beat; sleep 0.2; done ;;          # still beating after the session
+  cut) printf '{"type": "user", "message": {"content": "'
+       while :; do printf x; sleep 0.1; done ;;        # a record that never finishes
 esac
 FEED
   chmod +x "$dir/bin/agentlab-monitor" "$dir/bin/ssh"
@@ -123,7 +125,7 @@ FEED
     : > "$SESSION_FLAG"
     ( while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done; rm -f "$SESSION_FLAG" ) &
     watch_session & watch_pid=$!
-    case "$CASE" in normal|wedge) sleep 1; kill "$SESS" ;; esac
+    case "$CASE" in normal|wedge) sleep 1; kill "$SESS" ;; cut) sleep 0.3; kill "$SESS" ;; esac
     for _ in $(seq 1 60); do kill -0 "$SESS" 2>/dev/null || break; sleep 0.25; done
     stop_watch' >/dev/null 2>&1
   local state=running
@@ -151,6 +153,9 @@ check "gateway: a watcher that goes quiet but stays connected ends the session [
 out="$(gateway_case wedge)"
 check "gateway: a feed still running after the session is ended and flagged [$out]" \
   test "$out" = "0 ended 0 gone yes -"
+out="$(gateway_case cut)"
+check "gateway: a monitor stop after the session ended doesn't claim to end it [$out]" \
+  test "$out" = "8 ended 0 gone no -"
 out="$(gateway_case normal)"
 check "gateway: a session that ends by itself leaves no stop [$out]" test "$out" = "0 ended 0 gone no -"
 
@@ -213,6 +218,8 @@ for _ in range(40):
                   prompt auto >> "$proj/other.jsonl"; sleep 2
                   big "$proj/new.jsonl" & w1=$!; big "$proj/other.jsonl" & w2=$!; wait "$w1" "$w2" ;;
           stop)   pkill -STOP -f "$watcher" ;;
+          beatline) echo "{\"agentlab\": \"heartbeat\"}" >> "$proj/new.jsonl" ;;
+          partial) printf "{\"type\": \"user\", \"permissionMode\": \"acceptEd" >> "$proj/new.jsonl" ;;
         esac
         until_done 16 && when=early || when=held
         kill "$claude"; pkill -CONT -f "$watcher" 2>/dev/null
@@ -229,7 +236,9 @@ for _ in range(40):
   check "watcher: large records from two transcripts written at once arrive whole [$out]" test "$out" = "0 held"
   out="$(watch_case stop)"
   check "watcher: a paused watcher goes quiet, and that stops it [$out]" test "$out" = "8 early"
-  for c in kill swap delete truncate fifo; do
+  out="$(watch_case partial)"
+  check "watcher: a record left unfinished at the end isn't sent as a line [$out]" test "$out" = "0 held"
+  for c in kill swap delete truncate fifo beatline; do
     out="$(watch_case "$c")"
     check "watcher: tampering ($c) ends the watcher while the session runs [$out]" grep -q ' early$' <<<"$out"
   done

@@ -218,8 +218,8 @@ class ScanRules(unittest.TestCase):
             with open(bad, "wb") as f:
                 f.write(data)
             r = subprocess.run([sys.executable, "-I", SCAN, bad], capture_output=True, text=True)
-            self.assertEqual(r.returncode, 2, r.stderr)
-            self.assertIn("[unreadable-archive]", r.stdout)
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertIn("[scan-incomplete]", r.stdout)
             self.assertNotIn("Traceback", r.stderr)
 
     def test_archive_caps(self):
@@ -246,12 +246,13 @@ class ScanRules(unittest.TestCase):
             tgz = self.make_archive(d, {"p/a.jsonl": "x" * 5000 + "\n" + stream(prompt("go"))})
             restore = self.patched(MAX_LINE=100, MAX_ARCHIVE_BYTES=1000)
             try:
-                (label, (hits, *_)), = list(scan.scan_archive(tgz))
+                (label, (hits, *_)), (_, (stopped, *_)) = list(scan.scan_archive(tgz))
             finally:
                 restore()
         kinds = [h[1] for h in hits]
-        self.assertEqual(kinds, ["unreadable-line", "unreadable-archive"], hits)
-        self.assertIn("passed 1000 bytes", hits[1][3])
+        self.assertEqual(kinds, ["unreadable-line", "scan-incomplete"], hits)
+        self.assertIn("1000-byte transcript budget ran out here", hits[1][3])
+        self.assertEqual(stopped[0][1], "scan-incomplete")
 
     def test_members_the_scan_skips_count_against_the_stream_cap(self):
         with tempfile.TemporaryDirectory() as d:
@@ -262,7 +263,7 @@ class ScanRules(unittest.TestCase):
             finally:
                 restore()
         (label, (hits, *_)), = results
-        self.assertEqual(hits[0][1], "unreadable-archive")
+        self.assertEqual(hits[0][1], "scan-incomplete")
         self.assertIn("decompressed past 1000000 bytes", hits[0][3])
 
     def test_an_oversized_header_is_refused_before_it_is_read(self):
@@ -277,7 +278,7 @@ class ScanRules(unittest.TestCase):
                 info.pax_headers = {"comment": "c" * (2 * 1024 * 1024)}
                 tar.addfile(info, io.BytesIO(data))
             (label, (hits, *_)), = list(scan.scan_archive(tgz))
-        self.assertEqual(hits[0][1], "unreadable-archive")
+        self.assertEqual(hits[0][1], "scan-incomplete")
         self.assertIn("a member's headers passed 1048576 bytes", hits[0][3])
 
     def test_a_hard_link_to_nothing_before_it_is_reported(self):
@@ -294,6 +295,61 @@ class ScanRules(unittest.TestCase):
         hits, *_ = scan.scan_lines([line + b"\n"])
         kinds = sorted(h[1] for h in hits)
         self.assertEqual(kinds, ["lab-network", "unreadable-line"], hits)
+
+    def test_hard_links_to_one_file_are_scanned_once(self):
+        import tarfile
+        junk = stream(*[prompt("x" * 100)] * 20)
+        with tempfile.TemporaryDirectory() as d:
+            tgz = self.make_archive(
+                d, {"p/aaa/junk.txt": junk, "p/zzz/real.jsonl": stream(call(1, "Bash", command="ping 10.77.0.1"))},
+                links=[(f"p/aaa/l{i}.jsonl", tarfile.LNKTYPE, "p/aaa/junk.txt") for i in range(10)])
+            restore = self.patched(MAX_ARCHIVE_BYTES=len(junk) + 500)
+            try:
+                found = dict(scan.scan_archive(tgz))
+            finally:
+                restore()
+        kinds = {h[1] for hits, *_ in found.values() for h in hits}
+        self.assertNotIn("scan-incomplete", kinds, "ten links cost the budget one copy")
+        self.assertIn("lab-network", kinds)
+        self.assertEqual(sum(1 for hits, *_ in found.values() if hits and hits[0][1] == "linked-member"), 9)
+
+    def test_a_stopped_scan_lists_what_it_did_not_reach_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            members = {"p/aaa/decoy.jsonl": stream(*[prompt("x" * 100)] * 50)}
+            members.update({f"p/zzz/real-{i}.jsonl": stream(call(1, "Bash", command="ping 10.77.0.1"))
+                            for i in range(3)})
+            tgz = self.make_archive(d, members)
+            restore = self.patched(MAX_ARCHIVE_BYTES=2000)
+            try:
+                found = list(scan.scan_archive(tgz))
+            finally:
+                restore()
+            stop = found[-1][1][0][0]
+            self.assertEqual(stop[1], "scan-incomplete")
+            self.assertIn("3 more transcripts went unscanned: p/zzz/real-0.jsonl", stop[3])
+            env = dict(os.environ)
+            r = subprocess.run([sys.executable, "-I", "-c",
+                                "import sys, importlib.machinery, importlib.util\n"
+                                "spec = importlib.util.spec_from_loader('s', importlib.machinery.SourceFileLoader('s', sys.argv[1]))\n"
+                                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                                "m.MAX_ARCHIVE_BYTES = 2000\n"
+                                "sys.exit(m.main(sys.argv[2:]))", SCAN, tgz],
+                               capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("[scan-incomplete]", r.stdout.splitlines()[1], "the stop is printed first")
+
+    def test_past_the_member_cap_transcripts_are_listed(self):
+        with tempfile.TemporaryDirectory() as d:
+            members = {f"p/a{i}.txt": "x\n" for i in range(5)}
+            members.update({f"p/z{i}.jsonl": stream(prompt("go")) for i in range(4)})
+            tgz = self.make_archive(d, members)
+            restore = self.patched(MAX_MEMBERS=6)
+            try:
+                found = list(scan.scan_archive(tgz))
+            finally:
+                restore()
+        self.assertEqual(found[-1][1][0][0][1], "scan-incomplete")
+        self.assertIn("3 more transcripts went unscanned: p/z1.jsonl, p/z2.jsonl, p/z3.jsonl", found[-1][1][0][0][3])
 
     def test_hits_come_first(self):
         with tempfile.TemporaryDirectory() as d:
@@ -580,6 +636,15 @@ class HostileInput(unittest.TestCase):
         self.assertEqual(written, stream(prompt("go")).encode(), "heartbeats aren't evidence")
         rc, _, _ = self.run_monitor(beat * 3, "--session")
         self.assertEqual(rc, 6, "heartbeats alone confirm nothing")
+
+    def test_a_line_cut_off_by_the_end_of_the_feed_is_kept_not_read(self):
+        cut = stream(prompt("next", "acceptEdits")).encode()[:-20]
+        data = stream(prompt("go")).encode() + cut
+        rc, written, err = self.run_monitor(data, "--session")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(written, data, "the cut line is kept as evidence")
+        rc, _, _ = self.run_monitor(stream(init()).encode() + b'{"type": "assistant", "mess')
+        self.assertEqual(rc, 0, "a headless stream reads past it as before")
 
     def test_a_watcher_that_goes_quiet_stops_the_session(self):
         import time
