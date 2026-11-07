@@ -21,6 +21,8 @@ jobs:
         run: bash tests/run-all.sh
       - name: Firewall reachability (network namespaces, needs root)
         run: sudo bash tests/test_firewall.sh
+      - name: Launch preflight route checks (network namespace, needs root)
+        run: sudo bash tests/test_run.sh
 
   windows:
     runs-on: windows-latest

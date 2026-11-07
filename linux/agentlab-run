@@ -78,8 +78,9 @@ say "Sandbox preflight"
 # Runs as agent on the sandbox. Prints one line per failure.
 problems="$(sbx 'bash -s' <<'REMOTE'
 set -u
-ip route show default | grep -q . && echo "sandbox has a default route"
-ip -6 addr show scope global | grep -q inet6 && echo "sandbox has a global IPv6 address"
+# As strict as agentlab-check: any route beyond the lab, and any IPv6 address at all.
+ip -4 route show | grep -v '^10\.77\.0\.0/24' | grep -q . && echo "sandbox has a route beyond 10.77.0.0/24"
+ip -6 addr show 2>/dev/null | grep -q inet6 && echo "sandbox has an IPv6 address"
 getent hosts api.anthropic.com >/dev/null 2>&1 && echo "sandbox can resolve DNS"
 set -a; . /etc/environment; set +a
 [ "${ANTHROPIC_BASE_URL:-}" = "http://10.77.0.1:8080" ] || echo "ANTHROPIC_BASE_URL is not the proxy"
@@ -93,7 +94,7 @@ f=/etc/claude-code/managed-settings.json
 grep -q '"auto"' "$f" 2>/dev/null || echo "managed settings don't set auto mode"
 grep -q 'No network' "$f" 2>/dev/null || echo "managed settings lack the No-network rule (run sandbox-setup.sh finalize)"
 command -v claude >/dev/null || echo "claude not on PATH"
-id -nG | grep -qwE 'sudo|docker|adm|lxd' && echo "agent is in a privileged group"
+id -nG | grep -qwE 'sudo|docker|adm|lxd|admin|wheel' && echo "agent is in a privileged group"
 mkdir -p /work/inbox /work/target 2>/dev/null || echo "can't create /work folders"
 exit 0
 REMOTE

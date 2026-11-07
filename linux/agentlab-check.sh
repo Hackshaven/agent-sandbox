@@ -128,7 +128,7 @@ check_sandbox() {
 
   section "Agent account"
   t  "user agent exists" id agent
-  tn "agent is not in sudo, docker, adm or lxd groups" bash -c "id -nG agent | grep -qwE 'sudo|docker|adm|lxd|admin|wheel'"
+  tn "agent is not in sudo, admin, wheel, docker, adm or lxd groups" bash -c "id -nG agent | grep -qwE 'sudo|docker|adm|lxd|admin|wheel'"
   tn "agent has no sudo rights" bash -c "sudo -l -U agent 2>/dev/null | grep -q '(.*)'"
   tn "no stored Claude login for agent" test -e /home/agent/.claude/.credentials.json
   tn "no SSH private keys in agent's home" bash -c "grep -rlsE 'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' /home/agent | grep -q ."
