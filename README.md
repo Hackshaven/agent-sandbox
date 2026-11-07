@@ -108,6 +108,8 @@ Watch it. Stop with Ctrl+C at the first odd move (`.\agentlab.ps1 stop` is the
 hard off-switch). Afterward, read the whole transcript in
 `/var/log/agentlab/runs/<id>/` and note, for each attempt, whether the sandbox or
 auto mode stopped it. Any success is a blocker: fix it and retest before real runs.
+Run it a second time with `-Interactive`, which exercises the session watcher
+(attempt 7 in the template is aimed at it).
 
 ## Run a job
 
@@ -134,39 +136,79 @@ Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
 `remote_exit` and `monitor_exit` for a headless run; `session_exit`,
 `watch_exit`, `watch_remote_exit` and any `watch_stop` reason for an interactive
 one; `interrupted` after Ctrl+C.
-Folders older than 45 days are pruned.
+Folders older than 45 days are pruned. The files are kept byte for byte,
+including whatever the agent wrote, so read them with `less` (not `less -R`) or
+`cat -v`, never plain `cat` or `tail -f`, and don't paste into an admin console
+after reading `session.log`.
 
 ## When something changes
 
-- **New tools, a new Claude Code version, or a change to the sandbox scripts:**
-  `.\agentlab.ps1 reopen`, then `sudo ~/agentlab/linux/sandbox-setup.sh reopen` at
-  the sandbox console. If `linux/` changed, copy it over before `install`. Cutover
-  allows SSH only for `agent` from the gateway, so at the console run
-  `sudo rm /etc/ssh/sshd_config.d/00-agentlab.conf && sudo systemctl restart ssh`
-  and repeat step 3 for `agentlab-sbx` (cutover writes the file again). Then rerun
-  `install`, then steps 6 to 8. That is a sandbox change, so the escape test runs
-  again. `agentlab-run` refuses to start while the sandbox has a route out.
-- **A change to the gateway scripts** (the firewall, the proxy, or any `agentlab-*`
-  command): `gateway-setup.sh` installs copies, so nothing changes until it runs
-  again. Copy the kit to the gateway, rerun it (press Enter to keep the stored
-  token), and check:
+- **New tools, a new Claude Code version, or a change to `sandbox-setup.sh` or
+  `agentlab-check.sh`.** `agentlab.ps1 run` restores the old baseline until step 7
+  saves a new one, so finish all of this before the next real run:
+  1. `.\agentlab.ps1 reopen` (type REOPEN), then at the sandbox console
+     `sudo ~/agentlab/linux/sandbox-setup.sh reopen`.
+  2. Only if you're copying anything from Windows (a changed `linux/`, tools,
+     target source): cutover allows SSH only for `agent` from the gateway, so at
+     the console run
+     `sudo sed -i '/^AllowUsers/d' /etc/ssh/sshd_config.d/00-agentlab.conf && sudo systemctl restart ssh`
+     (if you log in with a password, delete its `PasswordAuthentication no` line
+     too; cutover writes the file again). Then from Windows:
+     ```powershell
+     ssh you@agentlab-sbx.mshome.net rm -rf agentlab/linux
+     scp -r ..\linux "you@agentlab-sbx.mshome.net:agentlab/"
+     ssh you@agentlab-sbx.mshome.net chmod +x agentlab/linux/*
+     ```
+  3. Rerun `install` with the options you used in step 5, plus any new
+     `--packages` or `--images`. The gateway's key is already on the sandbox:
+     `--gateway-key "$(sudo cut -d' ' -f2- /home/agent/.ssh/authorized_keys)"`.
+  4. Steps 6 to 8. That is a sandbox change, so the escape test runs again. After
+     a new Claude Code version, also check one interactive run against "Known
+     limits".
+- **A change to `gateway-setup.sh` (the firewall, the proxy, logging) or to
+  `agentlab-run`, `agentlab-monitor.py`, `agentlab-scan.py` or `agentlab-check.sh`.**
+  `gateway-setup.sh` installs copies, so nothing changes until it runs again. Copy
+  the kit to the gateway, rerun it (press Enter to keep the stored token, and pass
+  `--inside-if` again if the first run needed it), and check. It prints the run
+  key again; the sandbox already has it.
   ```powershell
   ssh you@agentlab-gw.mshome.net rm -rf agentlab/linux
   scp -r ..\linux "you@agentlab-gw.mshome.net:agentlab/"
   ssh you@agentlab-gw.mshome.net chmod +x agentlab/linux/*
   ```
   Then on the gateway: `sudo ~/agentlab/linux/gateway-setup.sh` and
-  `sudo agentlab-check gateway`.
+  `sudo agentlab-check gateway`. A firewall or proxy change moves the boundary
+  itself, so also check from the sandbox side and rerun the escape test before the
+  next real run: `.\agentlab.ps1 revert -Start`, then at the sandbox console
+  `sudo agentlab-check sandbox --model-call`, then `.\agentlab.ps1 revert` and
+  step 8. A change to `agentlab-check.sh` also needs the sandbox steps above,
+  since the sandbox has its own copy.
 - **New model:** rerun the escape test with `-Model <id>`.
 - **Proxy refusals:** `sudo agentlab-check gateway` lists refused paths. Allow one
   only if it is a model call: add an exact `location =` line beside the others in
   the proxy section of `linux/gateway-setup.sh`, update `docs/design.md` in the
   same commit, and deploy it as above. An edit to
   `/etc/nginx/sites-available/agentlab` alone skips review, and the next run of
-  `gateway-setup.sh` erases it.
+  `gateway-setup.sh` erases it. `agentlab-check gateway` reads the whole day's log,
+  so it lists the old 403s until the log rotates; the next run's review shows
+  only that run's.
 - **A hit during a run:** stop it, keep the run folder, report out-of-scope
   behavior through support.claude.com as a Cyber Verification Program participant,
-  and rotate the token (`claude setup-token`, then rerun `gateway-setup.sh`).
+  and rotate the token (`claude setup-token`, then rerun `gateway-setup.sh` and
+  paste the new one).
+  - Stopping: in a headless run, Ctrl+C stops the agent and collects the evidence.
+    In an interactive run Ctrl+C goes to Claude Code, so use `/exit`.
+    `.\agentlab.ps1 stop` powers the VM off at once, so there's no
+    `claude-projects.tgz`, and `run` reverts the VM either way. To keep the VM's
+    state, start the run with `-KeepRunning` and checkpoint it before you revert:
+    `Checkpoint-VM -Name agentlab-sbx -SnapshotName evidence-<id>`.
+  - Keeping: copy the run folder somewhere the 45-day prune won't reach.
+  - Reading: `transcript.jsonl` and `session-transcript.jsonl` were copied to the
+    gateway as the run went and end where the run was stopped;
+    `claude-projects.tgz` is everything the sandbox held at the end, which the
+    agent could have edited; `meta.txt` says how the run ended. If it has no
+    `ended=` line, collection didn't finish, so cut the run's lines from
+    `/var/log/agentlab/credproxy.log` and `egress-deny.log` by time.
 
 ## Testing
 
