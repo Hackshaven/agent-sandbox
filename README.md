@@ -27,7 +27,7 @@ Pro, Enterprise or Education.
 | `linux/agentlab-monitor.py` | Gateway | Live view; stops runs not in auto mode or over the denial budget |
 | `linux/agentlab-scan.py` | Gateway | Pattern rules over transcripts |
 | `templates/` | — | Task template and the escape test |
-| `tests/` | Linux or CI | Firewall, proxy and transcript-tool tests (see Testing) |
+| `tests/` | Linux or CI | Firewall, proxy, launcher and transcript-tool tests (see Testing) |
 | `docs/` | — | Design rationale, layout diagram, sources |
 | `.claude/agents/` | Claude Code sessions | Review agents from the agency-agents catalog, routed in `CLAUDE.md` |
 
@@ -142,10 +142,13 @@ Folders older than 45 days are pruned.
 ## Testing
 
 `tests/run-all.sh` runs everything that doesn't need the real VMs: lint, the
-transcript tools, and the credential proxy against a mock upstream. Run it with
-`sudo` to add the firewall tests, which build a two-namespace copy of the lab and
-check what the sandbox can and can't reach (with controls that prove the firewall,
-not the setup, is what blocks). CI runs all of it on every push, plus a parse and
+transcript tools, the launcher's limit checks, and the credential proxy against a
+mock upstream. Run it with `sudo` to add the firewall tests, which build a copy of
+the lab in three network namespaces (sandbox, gateway, and a stand-in for the
+internet) and check what gets through over TCP, UDP and, where the kernel has it,
+IPv6, including with forwarding turned on. Every refusal has a control: the same
+path, shown open before the rules load, so a pass means the firewall stopped it.
+CI runs all of it on every push, plus a parse, a time-limit check and a
 PSScriptAnalyzer pass on `agentlab.ps1`.
 
 These tests cover the scripts' logic, not your machine. The isolation checks in
