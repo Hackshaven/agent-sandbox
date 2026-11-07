@@ -45,8 +45,15 @@ sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@" 2> >(cat -v >&2); }
 # Refuse to launch on any limit that can't be read, rather than running uncapped.
 [[ -n "$TASK" && -f "$TASK" ]] || die "--task file not found: ${TASK:-<none>}"
 [[ "$TURNS" =~ ^[0-9]+$ ]] && (( TURNS >= 1 && TURNS <= 500 )) || die "--turns must be 1-500"
-# A zero duration means "no limit" to timeout(1), so the first digit can't be 0.
-[[ "$TIME" =~ ^[1-9][0-9]*[smh]?$ ]] || die "--time must be a positive duration such as 30m, 2h or 5400s"
+# A zero duration means "no limit" to timeout(1), so the first digit can't be 0,
+# and a run on an everyday laptop is capped at a day.
+[[ "$TIME" =~ ^[1-9][0-9]{0,5}[smh]?$ ]] || die "--time must be a positive duration such as 30m, 2h or 5400s"
+case "$TIME" in
+  *h) time_s=$(( ${TIME%h} * 3600 )) ;;
+  *m) time_s=$(( ${TIME%m} * 60 )) ;;
+  *)  time_s=${TIME%s} ;;
+esac
+(( time_s <= 86400 )) || die "--time must be at most 24h"
 [[ "$MODEL" =~ ^claude-[a-z0-9.-]+$ ]] || die "--model must be a full model ID such as claude-opus-5-5"
 [[ "$WAIT" =~ ^[0-9]+$ ]] || die "--wait must be seconds"
 [[ -z "$TARGET" || -d "$TARGET" ]] || die "--target folder not found: $TARGET"
@@ -79,9 +86,14 @@ say "Sandbox preflight"
 # Runs as agent on the sandbox. Prints one line per failure.
 problems="$(sbx 'bash -s' <<'REMOTE'
 set -u
-# As strict as agentlab-check: any route beyond the lab, and any IPv6 address at all.
-ip -4 route show | grep -v '^10\.77\.0\.0/24' | grep -q . && echo "sandbox has a route beyond 10.77.0.0/24"
+# As strict as agentlab-check: the lab route present (so an empty read fails), no
+# route beyond the lab in any routing table, no IPv6 address at all, one network
+# interface, and the lab address.
+ip -4 route show | grep -q '^10\.77\.0\.0/24 dev ' || echo "sandbox has no route to 10.77.0.0/24 (or its routes can't be read)"
+ip -4 route show table all | grep -vE '^(local|broadcast) |^10\.77\.0\.0/24 dev ' | grep -q . && echo "sandbox has a route beyond 10.77.0.0/24"
 ip -6 addr show 2>/dev/null | grep -q inet6 && echo "sandbox has an IPv6 address"
+[ "$(ip -o link show | awk -F': ' '$2 != "lo"' | grep -c .)" = 1 ] || echo "sandbox doesn't have exactly one network interface"
+ip -4 -o addr show | grep -q ' 10\.77\.0\.10/24 ' || echo "sandbox address isn't 10.77.0.10/24"
 getent hosts api.anthropic.com >/dev/null 2>&1 && echo "sandbox can resolve DNS"
 set -a; . /etc/environment; set +a
 [ "${ANTHROPIC_BASE_URL:-}" = "http://10.77.0.1:8080" ] || echo "ANTHROPIC_BASE_URL is not the proxy"
@@ -95,7 +107,8 @@ f=/etc/claude-code/managed-settings.json
 grep -q '"auto"' "$f" 2>/dev/null || echo "managed settings don't set auto mode"
 grep -q 'No network' "$f" 2>/dev/null || echo "managed settings lack the No-network rule (run sandbox-setup.sh finalize)"
 command -v claude >/dev/null || echo "claude not on PATH"
-id -nG | grep -qwE 'sudo|docker|adm|lxd|admin|wheel' && echo "agent is in a privileged group"
+id -nG | grep -qwE 'sudo|docker|adm|lxd|admin|wheel|disk|root|libvirt|incus-admin' && echo "agent is in a privileged group"
+sudo -n true 2>/dev/null && echo "agent can sudo without a password"
 mkdir -p /work/inbox /work/target 2>/dev/null || echo "can't create /work folders"
 exit 0
 REMOTE

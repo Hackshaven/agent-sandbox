@@ -39,8 +39,11 @@ param(
     [string]$Task,
     [string]$Target,
     [ValidateRange(1, 500)][int]$Turns = 60,
-    [ValidatePattern('^[1-9][0-9]*[smh]?$')][string]$Time = '2h',   # 0 would mean no limit
-    [ValidatePattern('^claude-[a-z0-9.-]+$')][string]$Model = 'claude-opus-5-5',
+    # Case-sensitive and anchored with \z, as agentlab-run reads them: .NET's $ also
+    # matches before a final newline, which would split the ssh command. 0 would
+    # mean no limit; agentlab-run also caps the time at 24h.
+    [ValidatePattern('^[1-9][0-9]{0,5}[smh]?\z', Options = 'None')][string]$Time = '2h',
+    [ValidatePattern('^claude-[a-z0-9.-]+\z', Options = 'None')][string]$Model = 'claude-opus-5-5',
     [switch]$Interactive,
     [switch]$KeepRunning,
     [string]$GatewayHost,

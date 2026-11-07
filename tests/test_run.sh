@@ -26,10 +26,10 @@ refused_for() {   # refused_for TEXT ARGS...: passes when the refusal contains T
 gets_past_limits() { refused_for "No run key" "$@"; }
 
 check "a valid task with default limits reaches the run-key check" gets_past_limits --task "$TMP/task.md"
-for t in 0 0s 0m 0h 00 05m "" -1 2d 1.5h 30M; do
+for t in 0 0s 0m 0h 00 05m "" -1 2d 1.5h 30M 25h 1441m 86401s 86401 1234567h; do
   check "--time '$t' is refused" refused_for "--time must be" --task "$TMP/task.md" --time "$t"
 done
-for t in 1 30m 2h 5400s 5400; do
+for t in 1 30m 2h 5400s 5400 24h 1440m 86400; do
   check "--time '$t' is accepted" gets_past_limits --task "$TMP/task.md" --time "$t"
 done
 for n in 0 501 x ""; do
@@ -48,25 +48,30 @@ check "sbx shows the sandbox's stderr with control characters visible" \
 
 # The sandbox preflight, as shipped: the heredoc agentlab-run sends over SSH.
 PREFLIGHT="$(heredoc_body "<<'REMOTE'" "$RUN" REMOTE)"
-NET_CHECKS="$(grep -E '^ip -[46] ' <<<"$PREFLIGHT")"
+NET_CHECKS="$(grep -E '^(ip |\[ "\$\(ip )' <<<"$PREFLIGHT")"
 GROUP_CHECK="$(grep -E '^id -nG ' <<<"$PREFLIGHT")"
-check "the preflight has one route check and one IPv6 check" test "$(grep -c . <<<"$NET_CHECKS")" -eq 2
+SUDO_CHECK="$(grep -E '^sudo -n ' <<<"$PREFLIGHT")"
+check "the preflight has its five network checks" test "$(grep -c . <<<"$NET_CHECKS")" -eq 5
 check "the preflight has one group check" test "$(grep -c . <<<"$GROUP_CHECK")" -eq 1
+check "the preflight has one sudo check" test "$(grep -c . <<<"$SUDO_CHECK")" -eq 1
+sudo_flagged() { [[ -n "$(SUDO_RC="$1" bash -c 'sudo() { return "$SUDO_RC"; }; '"$SUDO_CHECK" 2>/dev/null)" ]]; }
+check "the preflight refuses password-less sudo" sudo_flagged 0
+refuse "the preflight accepts an agent sudo refuses" sudo_flagged 1
 
 group_flagged() {   # group_flagged "GROUPS": the group check, for a user in GROUPS
   [[ -n "$(FAKE_GROUPS="$1" bash -c 'id() { echo "$FAKE_GROUPS"; }; '"$GROUP_CHECK" 2>/dev/null)" ]]
 }
-for g in sudo admin wheel docker adm lxd; do
+for g in sudo admin wheel docker adm lxd disk root libvirt incus-admin; do
   check "the preflight refuses an agent in $g" group_flagged "agent $g"
 done
 refuse "the preflight accepts an agent in no privileged group" group_flagged "agent users sudoers dockerx"
 
 # The three places that list the privileged groups have to agree.
 words() { tr -c 'a-z\n' ' ' | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
-quoted_alternation() { grep -oE "grep -qwE '[a-z|]+'" "$1" | head -1 | sed -E "s/.*'(.*)'/\1/" | words; }
+quoted_alternation() { grep -oE "grep -qwE '[a-z|-]+'" "$1" | head -1 | sed -E "s/.*'(.*)'/\1/" | words; }
 run_groups="$(quoted_alternation "$RUN")"
 check_groups="$(quoted_alternation "$REPO/linux/agentlab-check.sh")"
-setup_groups="$(grep -oE 'for g in [a-z ]+; do gpasswd' "$REPO/linux/sandbox-setup.sh" \
+setup_groups="$(grep -oE 'for g in [a-z -]+; do gpasswd' "$REPO/linux/sandbox-setup.sh" \
   | sed -E 's/for g in (.*); do gpasswd/\1/' | words)"
 check "the preflight lists privileged groups" test -n "$run_groups"
 check "agentlab-check checks the preflight's groups [$run_groups]" test "$check_groups" = "$run_groups"
@@ -179,18 +184,21 @@ else
   skip "PID namespaces unavailable here; skipping the session watcher"
 fi
 
-NS=agentlab-test-preflight
+NS=agentlab-test-preflight PEER=agentlab-test-preflight-peer
+ip netns del "$NS" 2>/dev/null; ip netns del "$PEER" 2>/dev/null   # left by a crashed run
 if ! ip netns add "$NS" 2>/dev/null; then
   skip "network namespaces unavailable here; skipping the preflight's route checks"
   finish; exit
 fi
-trap 'ip netns del "$NS" 2>/dev/null; rm -rf "$TMP"' EXIT
+ip netns add "$PEER"
+trap 'ip netns del "$NS" 2>/dev/null; ip netns del "$PEER" 2>/dev/null; rm -rf "$TMP"' EXIT
 X() { ip netns exec "$NS" "$@"; }
-# Like the sandbox after cutover: IPv6 off, one address on the lab subnet.
+# Like the sandbox after cutover: IPv6 off, one interface, one address on the lab subnet.
 X sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
 X ip link set lo up
-X ip link add eth0 type veth peer name eth0p
-X ip addr add 10.77.0.10/24 dev eth0; X ip link set eth0p up; X ip link set eth0 up
+X ip link add eth0 type veth peer name eth0p netns "$PEER"
+ip netns exec "$PEER" ip link set eth0p up
+X ip addr add 10.77.0.10/24 dev eth0; X ip link set eth0 up
 net_problems() { X bash -c "$NET_CHECKS" 2>/dev/null; }
 
 check "a sandbox with only the lab subnet passes" test -z "$(net_problems)"
@@ -200,6 +208,17 @@ X ip route del 192.0.2.0/24 via 10.77.0.1
 X ip route add default via 10.77.0.1
 check "a default route is refused" grep -q "route beyond" <<<"$(net_problems)"
 X ip route del default via 10.77.0.1
+X ip route add default via 10.77.0.1 table 100; X ip rule add pref 100 lookup 100
+check "a route in another routing table is refused" grep -q "route beyond" <<<"$(net_problems)"
+X ip rule del pref 100; X ip route del default via 10.77.0.1 table 100
+X ip link add eth1 type dummy 2>/dev/null || X ip link add eth1 type veth peer name eth1p
+check "a second interface is refused" grep -q "exactly one network interface" <<<"$(net_problems)"
+X ip link del eth1
+X ip addr del 10.77.0.10/24 dev eth0; X ip addr add 10.77.0.20/24 dev eth0
+check "another address is refused" grep -q "isn't 10.77.0.10/24" <<<"$(net_problems)"
+check "with no lab route, an empty read is refused" grep -q "no route to 10.77.0.0/24" \
+  <<<"$(ip netns exec "$NS" env PATH=/nonexistent /bin/bash -c "$NET_CHECKS" 2>/dev/null)"
+X ip addr del 10.77.0.20/24 dev eth0; X ip addr add 10.77.0.10/24 dev eth0
 if X sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0 2>/dev/null && X ip -6 addr add fd77::10/64 dev eth0 nodad 2>/dev/null; then
   check "an IPv6 address is refused" grep -q "IPv6 address" <<<"$(net_problems)"
 else

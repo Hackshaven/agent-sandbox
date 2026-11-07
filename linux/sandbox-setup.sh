@@ -100,7 +100,7 @@ phase_install() {
   if ! id agent >/dev/null 2>&1; then
     adduser --disabled-password --gecos "lab agent" agent
   fi
-  for g in sudo docker adm lxd admin wheel; do gpasswd -d agent "$g" >/dev/null 2>&1 || true; done
+  for g in sudo docker adm lxd admin wheel disk root libvirt incus-admin; do gpasswd -d agent "$g" >/dev/null 2>&1 || true; done
   install -d -m 755 -o agent -g agent /work /work/target /work/inbox
 
   say "Gateway SSH key"

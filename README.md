@@ -177,8 +177,8 @@ the lab in three network namespaces (sandbox, gateway, and a stand-in for the
 internet) and check what gets through over TCP, UDP and, where the kernel has it,
 IPv6, including with forwarding turned on. Every refusal has a control: the same
 path, shown open before the rules load, so a pass means the firewall stopped it.
-CI runs all of it on every push, plus a parse, a time-limit check and a
-PSScriptAnalyzer pass on `agentlab.ps1`.
+CI runs all of it on every push, plus a parse, a check of `-Time` and `-Model`
+under both PowerShell versions, and a PSScriptAnalyzer pass on `agentlab.ps1`.
 
 These tests cover the scripts' logic, not your machine. The isolation checks in
 steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.

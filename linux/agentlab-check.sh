@@ -98,7 +98,8 @@ check_sandbox() {
   local ifs
   section "Network"
   tn "no default route" bash -c 'ip route show default | grep -q .'
-  tn "no IPv4 routes beyond 10.77.0.0/24" bash -c "ip -4 route show | grep -v '^10\.77\.0\.0/24' | grep -q ."
+  tn "no IPv4 routes beyond 10.77.0.0/24, in any routing table" \
+     bash -c "ip -4 route show table all | grep -vE '^(local|broadcast) |^10\.77\.0\.0/24 dev ' | grep -q ."
   tn "no IPv6 addresses (including link-local)" bash -c 'ip -6 addr show | grep -q inet6'
   t  "address is $SBX_IP/24" bash -c "ip -4 -o addr show | grep -q ' $SBX_IP/24 '"
   ifs="$(ip -o link show | awk -F': ' '$2 != "lo" {print $2}' | cut -d@ -f1)"
@@ -128,7 +129,7 @@ check_sandbox() {
 
   section "Agent account"
   t  "user agent exists" id agent
-  tn "agent is not in sudo, admin, wheel, docker, adm or lxd groups" bash -c "id -nG agent | grep -qwE 'sudo|docker|adm|lxd|admin|wheel'"
+  tn "agent is in no privileged group" bash -c "id -nG agent | grep -qwE 'sudo|docker|adm|lxd|admin|wheel|disk|root|libvirt|incus-admin'"
   tn "agent has no sudo rights" bash -c "sudo -l -U agent 2>/dev/null | grep -q '(.*)'"
   tn "no stored Claude login for agent" test -e /home/agent/.claude/.credentials.json
   tn "no SSH private keys in agent's home" bash -c "grep -rlsE 'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' /home/agent | grep -q ."

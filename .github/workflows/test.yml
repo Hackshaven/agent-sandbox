@@ -36,23 +36,12 @@ jobs:
             "$PWD/windows/agentlab.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors | ForEach-Object { Write-Error "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
           Write-Host 'agentlab.ps1 parses cleanly'
-      - name: Time limit validation
+      - name: Limit validation (PowerShell 7)
         shell: pwsh
-        run: |
-          # Parameters bind before the script body runs, so a refused value never
-          # reaches Hyper-V. A value that binds fails later, at the admin check or
-          # at "run needs -Task", which is not a binding error.
-          function Test-Binds([string]$time) {
-            try { & ./windows/agentlab.ps1 run -Time $time *> $null; $true }
-            catch { -not ($_.Exception -is [System.Management.Automation.ParameterBindingException]) }
-          }
-          $accepted = @('0', '0s', '00', '05m') | Where-Object { Test-Binds $_ }
-          $refused = @('1', '30m', '2h', '5400s') | Where-Object { -not (Test-Binds $_) }
-          if ($accepted -or $refused) {
-            Write-Error "Accepted but should refuse: $accepted. Refused but should accept: $refused."
-            exit 1
-          }
-          Write-Host 'agentlab.ps1 refuses a zero time limit'
+        run: ./tests/test_ps1_limits.ps1
+      - name: Limit validation (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/test_ps1_limits.ps1
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
