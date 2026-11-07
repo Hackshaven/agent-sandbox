@@ -37,7 +37,7 @@ Docker still has a job: rootless Docker runs local targets *inside* the sandbox 
 | Setup phase, then attack phase | Tools installed with internet in `install`; `cutover` is permanent; changes go through `reopen` and a re-check | `sandbox-setup.sh` |
 | Test the sandbox before relying on it | Config checks, hand checks and a supervised escape test, repeated after any sandbox or model change | `agentlab-check.sh`, `templates/escape-test.md` |
 | Keep transcripts and logs 30+ days, review them | 45-day retention; per-run evidence folder; pattern scan; new proxy refusals and firewall denies printed after each run | `gateway-setup.sh`, `agentlab-run`, `agentlab-scan.py` |
-| Stop on repeated denials | Monitor ends a run after 3 denials in a row or 20 total, and if the run isn't in auto mode or doesn't say which mode it's in. Interactive runs too: `agentlab-run` feeds it the session transcript and ends the session when it stops | `agentlab-monitor.py`, `agentlab-run` |
+| Stop on repeated denials | Monitor ends a run after 3 denials in a row or 20 total, if the run isn't in auto mode or doesn't say which mode it's in, and on input past its size limits. Interactive runs too: a watcher follows the session transcript, and the gateway ends the session when the monitor stops it or the watcher stops reading | `agentlab-monitor.py`, `agentlab-run` |
 | Scope stated as intent in every task | Runs refuse a task file without a `## Scope` section | `agentlab-run`, `templates/task-template.md` |
 
 The firewall logs every protocol, not just refused HTTPS. That closes a gap the
@@ -54,7 +54,7 @@ proxy log line.
 | Proxy forwards model calls only | The path allowlist is a starting guess | Tune it from 403 lines after the first real run, in `gateway-setup.sh` so the change is reviewed and survives a rerun |
 | Treat auto mode rules as security config | Root-owned managed settings; the agent isn't root | Recheck `claude auto-mode config` after every Claude Code update |
 | Orchestrator on the trusted side | An interactive run puts the agent's terminal on yours, escape sequences included; nothing filters a live session | Prefer headless runs for anything long or unwatched |
-| Stop runs that leave auto mode | An interactive session's mode is read from each prompt in its transcript, so a mode change mid-turn shows at the next prompt | The operator is watching an interactive run by definition; the scan flags any prompt outside auto mode afterward |
+| Stop runs that leave auto mode | The interactive watcher reads a transcript the agent can write, through processes the agent owns, so it's a tripwire that fails closed when it notices (a lost watcher ends the session from the gateway), not a control. The agent can still feed it false lines or freeze it unnoticed. The mode is read from each prompt, so a change mid-turn or in a queued prompt shows at the next recorded one. Subagent transcripts are separate files the watcher doesn't follow | The operator watches an interactive run by definition, and the review scans every transcript the sandbox kept afterward. `stop_remote` also runs through the agent's own shell, so the gateway ends the local session too, and the revert after the run is the backstop |
 
 Whatever the agent sends to the model, including target code and findings, leaves
 the network in request bodies the proxy doesn't log.

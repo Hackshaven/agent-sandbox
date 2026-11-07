@@ -121,11 +121,19 @@ prints any new proxy refusals and firewall denies, and reverts again.
 
 Add `-Interactive` for a supervised session instead. It's recorded on the gateway,
 and `agentlab-monitor` follows its transcript and ends the session if a prompt is
-sent outside auto mode or the denial budget runs out.
+sent outside auto mode (switching to plan or accept-edits mode ends it too), the
+denial budget runs out, the transcript holds a line the monitor won't trust, or
+the watcher stops reading while the session runs. It follows the new transcript
+`/clear` starts. The watcher runs as the agent on the sandbox, so treat it as a
+tripwire, not a guard: keep watching the session.
 
 Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
-(headless) or `session.log` and `session-transcript.jsonl` (interactive),
-`claude-projects.tgz`, `credproxy.new.log`, `egress-deny.new.log` and `scan.txt`.
+(headless) or `session.log`, `session-transcript.jsonl`, `session-monitor.log` and
+`watch.log` (interactive), `claude-projects.tgz`, `credproxy.new.log`,
+`egress-deny.new.log` and `scan.txt`. `meta.txt` records how the run ended:
+`remote_exit` and `monitor_exit` for a headless run; `session_exit`,
+`watch_exit`, `watch_remote_exit` and any `watch_stop` reason for an interactive
+one; `interrupted` after Ctrl+C.
 Folders older than 45 days are pruned.
 
 ## When something changes
@@ -191,6 +199,12 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
   one Claude Code version writes them. If yours doesn't, a headless run stops at
   init (exit 6) and an interactive one ends flagged as unconfirmed. Check the
   first run of each kind.
+- The interactive watcher assumes, from Claude Code 2.1.319, that a session's
+  transcript is a `.jsonl` file directly under `~/.claude/projects/<dir>/`, that
+  `/clear` starts a new one, and that subagents write separate files below it.
+  If yours differs, the watcher finds no transcript and ends the session five
+  minutes after it starts, or follows the wrong file. Check one interactive
+  run after each Claude Code update.
 - Unverified until your first run: that auto mode works with a custom
   `ANTHROPIC_BASE_URL` on your plan, which extra paths Claude Code requests, and
   that `/etc/claude-code/managed-settings.json` is read (the sandbox check tests

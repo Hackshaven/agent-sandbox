@@ -64,19 +64,69 @@ check "the preflight lists privileged groups" test -n "$run_groups"
 check "agentlab-check checks the preflight's groups [$run_groups]" test "$check_groups" = "$run_groups"
 check "sandbox-setup removes the preflight's groups [$run_groups]" test "$setup_groups" = "$run_groups"
 
+# The gateway side of the interactive watcher, as shipped: end_session,
+# watch_session and stop_watch from agentlab-run, run against a fake ssh feed, a
+# stop_remote that (like a sandbox that won't listen) stops nothing, and a stand-in
+# for the operator's ssh -t session. A watcher that stops, or is lost while the
+# session runs, must end that session from the gateway.
+GATEWAY_WATCH="$(awk '/^SESSION_FLAG=/ { f = 1 } /^trap .*Interrupted/ { exit } f' "$RUN")"
+check "the gateway watcher functions are found" grep -q '^end_session()' <<<"$GATEWAY_WATCH"
+gateway_case() {   # gateway_case NAME: prints "<watch_exit> <ended|running> <stop reason or ->"
+  local dir="$TMP/gw-$1" sess
+  mkdir -p "$dir/bin"
+  printf '#!/bin/sh\nexec python3 -I %s "$@"\n' "$REPO/linux/agentlab-monitor.py" > "$dir/bin/agentlab-monitor"
+  chmod +x "$dir/bin/agentlab-monitor"
+  bash -c 'exec -a "ssh -t agent@10.77.0.10 x; echo \$\$ >\"\$HOME/.agentlab-session.pid\"; $1" sleep 60' _ "$1" &
+  sess=$!
+  CASE="$1" SESS="$sess" RUN_DIR="$dir" PATH="$dir/bin:$PATH" GATEWAY_WATCH="$GATEWAY_WATCH" bash -c '
+    SBX=10.77.0.10; SSH_OPTS=(); WATCH_REMOTE=unused
+    eval "$GATEWAY_WATCH"
+    prompt() { printf "{\"type\": \"user\", \"permissionMode\": \"%s\", \"message\": {\"content\": \"hi\"}}\n" "$1"; }
+    ssh() {   # the feed: what the sandbox side would send
+      prompt auto
+      case "$CASE" in
+        stops) prompt plan; sleep 30 ;;
+        lost) ;;
+        normal) while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done ;;
+      esac
+    }
+    stop_remote() { echo stop_remote >> "$RUN_DIR/calls"; }
+    : > "$SESSION_FLAG"
+    ( while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done; rm -f "$SESSION_FLAG" ) &
+    watch_session & watch_pid=$!
+    [ "$CASE" = normal ] && { sleep 1; kill "$SESS"; }
+    for _ in $(seq 1 60); do kill -0 "$SESS" 2>/dev/null || break; sleep 0.25; done
+    stop_watch' >/dev/null 2>&1
+  local state=running
+  kill -0 "$sess" 2>/dev/null || state=ended
+  kill "$sess" 2>/dev/null; wait "$sess" 2>/dev/null
+  printf '%s %s %s\n' "$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$dir/meta.txt" | tail -1)" "$state" \
+    "$(sed -n 's/^watch_stop=\(.*\) at=.*/\1/p' "$dir/meta.txt" | tail -1 | grep . || echo -)"
+}
+out="$(gateway_case stops)"
+check "gateway: a monitor stop ends the session even if the sandbox ignores it [$out]" \
+  grep -q '^3 ended the monitor stopped it' <<<"$out"
+out="$(gateway_case lost)"
+check "gateway: a watcher lost mid-session ends the session [$out]" \
+  grep -q '^0 ended the watcher ended (exit 0) while the session ran' <<<"$out"
+out="$(gateway_case normal)"
+check "gateway: a session that ends by itself leaves no stop [$out]" test "$out" = "0 ended -"
+
 if [[ $EUID -ne 0 ]]; then
   skip "not root: the session watcher and the preflight's route checks need namespaces (CI runs them with sudo)"
   finish; exit
 fi
 
-# The interactive session watcher, as shipped: the remote script agentlab-run sends
-# over SSH, run here against a stand-in claude process and transcript, piped into
-# agentlab-monitor --session as agentlab-run does. Its own PID namespace keeps
-# any real claude process on this machine out of its pgrep.
-WATCH="$(awk "/^WATCH_REMOTE='/ { f = 1; sub(/^WATCH_REMOTE='/, \"\") } f { print } f && /^done'\$/ { exit }" "$RUN" | sed "\$s/'\$//")"
+# The sandbox side of the interactive watcher, as shipped: the remote script
+# agentlab-run sends over SSH, run here against a stand-in session (its PID in
+# ~/.agentlab-session.pid, as the real launch writes it) and transcript files,
+# piped into agentlab-monitor --session as agentlab-run does. Its own PID
+# namespace keeps the tests' pkill away from anything else on this machine.
+WATCH="$(awk "/^WATCH_REMOTE='/ { f = 1; sub(/^WATCH_REMOTE='/, \"\") } f { print } f && /'\$/ { exit }" "$RUN" \
+  | sed "\$s/'\$//")"
 check "the session watcher script is found" grep -q 'tail --pid' <<<"$WATCH"
 if unshare --pid --fork --mount-proc true 2>/dev/null; then
-  watch_case() {   # watch_case NAME: run one scenario; prints the monitor's exit code
+  watch_case() {   # watch_case NAME: prints "<monitor exit> <early|held>"
     local home="$TMP/$1"
     mkdir -p "$home/bin" "$home/.claude/projects/-work-target"
     cp "$(command -v sleep)" "$home/bin/claude"
@@ -84,25 +134,43 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
       unshare --pid --fork --mount-proc bash -c '
         prompt() { printf "{\"type\": \"user\", \"permissionMode\": \"%s\", \"message\": {\"content\": \"hi\"}}\n" "$1"; }
         proj="$HOME/.claude/projects/-work-target"
+        until_seen() { for _ in $(seq 1 40); do grep -q "$1" "$HOME/out.jsonl" 2>/dev/null && return 0; sleep 0.25; done; return 1; }
+        until_done() { for _ in $(seq 1 "$1"); do [ -s "$HOME/rc" ] && return 0; sleep 0.25; done; return 1; }
         [ "$CASE" = stale ] && { prompt default > "$proj/old.jsonl"; sleep 1.1; }
-        "$HOME/bin/claude" 60 & claude=$!
+        "$HOME/bin/claude" 120 & claude=$!
+        echo "$claude" > "$HOME/.agentlab-session.pid"
         { bash -c "$WATCH" | python3 -I "$MONITOR" --session --quiet --out "$HOME/out.jsonl"
           echo "${PIPESTATUS[1]}" > "$HOME/rc"; } &
-        sleep 1.5
+        sleep 1.2                      # transcripts must be newer than the watcher
         prompt auto >> "$proj/new.jsonl"
-        [ "$CASE" = leaves ] && { sleep 1.5; prompt acceptEdits >> "$proj/new.jsonl"; }
-        sleep 2.5
-        kill "$claude"
-        for _ in $(seq 1 10); do [ -s "$HOME/rc" ] && break; sleep 0.5; done
-        cat "$HOME/rc" 2>/dev/null || echo none'
+        until_seen "\"auto\"" || { echo "never-followed"; kill "$claude"; exit; }
+        case "$CASE" in
+          leaves) prompt acceptEdits >> "$proj/new.jsonl" ;;
+          clear)  sleep 1.1; prompt plan >> "$proj/cleared.jsonl" ;;
+          init)   echo "{\"type\": \"system\", \"subtype\": \"init\"}" >> "$proj/new.jsonl" ;;
+          kill)   pkill -x tail ;;
+          swap)   mv "$proj/new.jsonl" "$proj/new.bak"; ln -s /dev/null "$proj/new.jsonl" ;;
+          stop)   pkill -STOP -x tail ;;
+        esac
+        until_done 16 && when=early || when=held
+        kill "$claude"; pkill -CONT -x tail 2>/dev/null
+        until_done 20
+        echo "$(cat "$HOME/rc" 2>/dev/null || echo none) $when"'
   }
-  check "watcher: a session that stays in auto mode ends cleanly (0)" test "$(watch_case stays)" = 0
-  check "watcher: a prompt sent outside auto mode stops it (3)" test "$(watch_case leaves)" = 3
-  check "watcher: a transcript from before the session is ignored (0)" test "$(watch_case stale)" = 0
+  check "watcher: a session that stays in auto mode is followed to its end" test "$(watch_case stays)" = "0 held"
+  check "watcher: a prompt sent outside auto mode stops it" test "$(watch_case leaves)" = "3 early"
+  check "watcher: a transcript from before the session is ignored" test "$(watch_case stale)" = "0 held"
+  check "watcher: it follows the new transcript /clear starts" test "$(watch_case clear)" = "3 early"
+  check "watcher: an init record written into the transcript stops it" test "$(watch_case init)" = "7 early"
+  for c in kill swap stop; do
+    out="$(watch_case "$c")"
+    check "watcher: tampering ($c) ends the watcher while the session runs [$out]" grep -q ' early$' <<<"$out"
+  done
   check "watcher: the gateway keeps a copy of what it followed" grep -q '"permissionMode": "auto"' "$TMP/stays/out.jsonl"
 else
   skip "PID namespaces unavailable here; skipping the session watcher"
 fi
+
 NS=agentlab-test-preflight
 if ! ip netns add "$NS" 2>/dev/null; then
   skip "network namespaces unavailable here; skipping the preflight's route checks"
