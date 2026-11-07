@@ -165,4 +165,4 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Copyright 2026 Eric Hackathorn. Licensed under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
