@@ -18,7 +18,12 @@ Exit codes: 0 finished, 3 not in auto mode, 4 denial budget spent,
 5 no init message seen, 6 auto mode not confirmed (an init message with no
 permissionMode, or with --session, no prompt that records one), 7 input it
 won't trust (a record over --max-line-bytes, more than --max-total-bytes in
-all, or with --session, a line that isn't a transcript record).
+all, or with --session, a line that isn't a transcript record or isn't valid
+UTF-8), 8 nothing arrived for --stall seconds.
+
+With --session, the watcher agentlab-run starts on the sandbox sends a
+heartbeat line every second, which is skipped (not copied to --out), so with
+--stall a watcher that freezes stops the run as surely as one that exits.
 
 The monitor reads input the agent can shape, and with --session a file the
 agent can write, so a record it can't parse never ends its loop: the raw bytes
@@ -32,6 +37,7 @@ Check them against the first real transcript and adjust --deny-pattern if needed
 import argparse
 import json
 import re
+import signal
 import sys
 
 DEFAULT_DENY = (r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|"
@@ -39,6 +45,15 @@ DEFAULT_DENY = (r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|"
                 r"permission to use \S{1,64} (has been|was) denied|"
                 r"denied by (the )?(claude code )?(auto[- ]mode|permission) classifier)")
 DEFAULT_UNAVAILABLE = r"(?i)temporarily unavailable, so auto mode cannot determine"
+HEARTBEAT = b'{"agentlab": "heartbeat"}\n'   # what agentlab-run's session watcher sends
+
+
+class Stalled(Exception):
+    pass
+
+
+def on_alarm(signum, frame):
+    raise Stalled()
 
 
 def text_of(content):
@@ -113,9 +128,14 @@ def main():
                          "fail (exit 6) at the end if no prompt confirmed auto mode")
     ap.add_argument("--max-line-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--max-total-bytes", type=int, default=1024 * 1024 * 1024)
+    ap.add_argument("--stall", type=int, default=0,
+                    help="stop (exit 8) if no line, heartbeat included, arrives for this many "
+                         "seconds; 0, the default, waits for ever")
     ap.add_argument("--log", help="write the view to this file instead of the terminal")
     ap.add_argument("--quiet", action="store_true", help="no terminal view")
     args = ap.parse_args()
+    if args.stall < 0:
+        ap.error("--stall must be 0 or more")
 
     deny_re = re.compile(args.deny_pattern)
     unavail_re = re.compile(args.unavailable_pattern)
@@ -215,14 +235,32 @@ def main():
                  f"{state['unavailable']} unavailable")
         return None
 
+    stdin = sys.stdin.buffer
+
+    def next_line():
+        if not args.stall:
+            return stdin.readline(args.max_line_bytes + 1)
+        signal.alarm(args.stall)   # a stalled read raises Stalled; nothing else is timed
+        try:
+            return stdin.readline(args.max_line_bytes + 1)
+        finally:
+            signal.alarm(0)
+
+    if args.stall:
+        signal.signal(signal.SIGALRM, on_alarm)
     total = 0
     lineno = 0
     with open(args.out, "ab") as out:
-        stdin = sys.stdin.buffer
         while True:
-            raw = stdin.readline(args.max_line_bytes + 1)
+            try:
+                raw = next_line()
+            except Stalled:
+                show(f"  ! STOP: nothing arrived for {args.stall} seconds, so nothing is watching")
+                return 8
             if not raw:
                 break
+            if args.session and raw == HEARTBEAT:
+                continue
             out.write(raw)
             out.flush()
             lineno += 1
@@ -233,7 +271,13 @@ def main():
             if len(raw) > args.max_line_bytes:
                 show(f"  ! STOP: line {lineno} is longer than {args.max_line_bytes} bytes")
                 return 7
-            line = raw.decode("utf-8", errors="replace").strip()
+            try:
+                # Claude Code writes UTF-8. In a session file the agent can write,
+                # a bad byte inside a JSON string would otherwise parse.
+                line = raw.decode("utf-8", errors="strict" if args.session else "replace").strip()
+            except UnicodeDecodeError:
+                show(f"  ! STOP: line {lineno} isn't valid UTF-8")
+                return 7
             if not line:
                 continue
             try:

@@ -92,64 +92,80 @@ LAUNCH_LINE="$(grep -oE '"timeout --foreground -k 30 .*permission-mode auto'"'"'
 SESSION_CMD="$(bash -c 'SSH_OPTS=(-i key -o BatchMode=yes); SBX=10.77.0.10; REMOTE_ENV="cd /work/target"
   time_s=60; TIME=1m; MODEL=claude-x; eval "cmd=$1"; printf %s "$cmd"' _ "$LAUNCH_LINE")"
 check "the interactive launch line is found" grep -q -- '-t agent@10.77.0.10 .*agentlab-session.pid' <<<"$SESSION_CMD"
-gateway_case() {   # gateway_case NAME: prints "<watch_exit> <ended|running> <stop reason or ->"
-  local dir="$TMP/gw-$1" sess
+gateway_case() {   # gateway_case NAME: prints "<watch_exit> <ended|running> <stop_remote calls> <feed gone|left> <unfinished yes|no> <stop reason or ->"
+  local dir="$TMP/gw-$1" sess feed
   mkdir -p "$dir/bin"
   printf '#!/bin/sh\nexec python3 -I %s "$@"\n' "$REPO/linux/agentlab-monitor.py" > "$dir/bin/agentlab-monitor"
-  chmod +x "$dir/bin/agentlab-monitor"
+  # The feed: what the sandbox side would send. A script, since timeout runs it.
+  cat > "$dir/bin/ssh" <<'FEED'
+#!/bin/bash
+echo $$ > "$RUN_DIR/feed-ssh.pid"
+prompt() { printf '{"type": "user", "permissionMode": "%s", "message": {"content": "hi"}}\n' "$1"; }
+beat() { printf '{"agentlab": "heartbeat"}\n'; }
+prompt auto
+case "$CASE" in
+  stops|hang) prompt plan; sleep 30 ;;
+  lost) ;;
+  normal) while kill -0 "$SESS" 2>/dev/null; do beat; sleep 0.2; done ;;
+  quiet) sleep 30 ;;                                   # connected, but silent
+  wedge) while :; do beat; sleep 0.2; done ;;          # still beating after the session
+esac
+FEED
+  chmod +x "$dir/bin/agentlab-monitor" "$dir/bin/ssh"
   bash -c 'exec -a "$1" sleep 60' _ "$SESSION_CMD" &
   sess=$!
   CASE="$1" SESS="$sess" RUN_DIR="$dir" PATH="$dir/bin:$PATH" GATEWAY_WATCH="$GATEWAY_WATCH" bash -c '
-    SBX=10.77.0.10; SSH_OPTS=(); WATCH_REMOTE=unused
+    export CASE SESS RUN_DIR
+    SBX=10.77.0.10; SSH_OPTS=(); WATCH_REMOTE=unused; time_s=60
     eval "$GATEWAY_WATCH"
-    prompt() { printf "{\"type\": \"user\", \"permissionMode\": \"%s\", \"message\": {\"content\": \"hi\"}}\n" "$1"; }
-    ssh() {   # the feed: what the sandbox side would send
-      prompt auto
-      case "$CASE" in
-        stops|hang) prompt plan; sleep 30 ;;
-        lost) ;;
-        normal) while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done ;;
-      esac
-    }
+    WATCH_STALL=2 WATCH_GRACE=3
     stop_remote() { echo stop_remote >> "$RUN_DIR/calls"; [ "$CASE" = hang ] && sleep 30; true; }
     : > "$SESSION_FLAG"
     ( while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done; rm -f "$SESSION_FLAG" ) &
     watch_session & watch_pid=$!
-    [ "$CASE" = normal ] && { sleep 1; kill "$SESS"; }
+    case "$CASE" in normal|wedge) sleep 1; kill "$SESS" ;; esac
     for _ in $(seq 1 60); do kill -0 "$SESS" 2>/dev/null || break; sleep 0.25; done
     stop_watch' >/dev/null 2>&1
   local state=running
   kill -0 "$sess" 2>/dev/null || state=ended
   kill "$sess" 2>/dev/null; wait "$sess" 2>/dev/null
-  printf '%s %s %s %s\n' "$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$dir/meta.txt" | tail -1)" "$state" \
-    "$(grep -c stop_remote "$dir/calls" 2>/dev/null || echo 0)" \
+  feed=gone
+  [[ -s "$dir/feed-ssh.pid" ]] && kill -0 "$(cat "$dir/feed-ssh.pid")" 2>/dev/null && feed=left
+  printf '%s %s %s %s %s %s\n' "$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$dir/meta.txt" | tail -1)" "$state" \
+    "$(grep -c stop_remote "$dir/calls" 2>/dev/null || echo 0)" "$feed" \
+    "$(grep -q '^watch_unfinished=' "$dir/meta.txt" && echo yes || echo no)" \
     "$(sed -n 's/^watch_stop=\(.*\) at=.*/\1/p' "$dir/meta.txt" | tail -1 | grep . || echo -)"
 }
 out="$(gateway_case stops)"
 check "gateway: a monitor stop ends the session even if the sandbox ignores it [$out]" \
-  grep -q '^3 ended 1 the monitor stopped it' <<<"$out"
+  grep -q '^3 ended 1 gone no the monitor stopped it' <<<"$out"
 out="$(gateway_case hang)"
 check "gateway: it ends the session even while stop_remote hangs [$out]" \
-  grep -q '^3 ended 1 the monitor stopped it' <<<"$out"
+  grep -q '^3 ended 1 gone no the monitor stopped it' <<<"$out"
 out="$(gateway_case lost)"
 check "gateway: a watcher lost mid-session ends the session [$out]" \
-  grep -q '^0 ended 1 the watcher ended (exit 0) while the session ran' <<<"$out"
+  grep -q '^0 ended 1 gone no the watcher ended (exit 0) while the session ran' <<<"$out"
+out="$(gateway_case quiet)"
+check "gateway: a watcher that goes quiet but stays connected ends the session [$out]" \
+  grep -q '^8 ended 1 gone no the monitor stopped it (exit 8)' <<<"$out"
+out="$(gateway_case wedge)"
+check "gateway: a feed still running after the session is ended and flagged [$out]" \
+  test "$out" = "0 ended 0 gone yes -"
 out="$(gateway_case normal)"
-check "gateway: a session that ends by itself leaves no stop [$out]" test "$out" = "0 ended 0 -"
+check "gateway: a session that ends by itself leaves no stop [$out]" test "$out" = "0 ended 0 gone no -"
 
 if [[ $EUID -ne 0 ]]; then
   skip "not root: the session watcher and the preflight's route checks need namespaces (CI runs them with sudo)"
   finish; exit
 fi
 
-# The sandbox side of the interactive watcher, as shipped: the remote script
-# agentlab-run sends over SSH, run here against a stand-in session (its PID in
-# ~/.agentlab-session.pid, as the real launch writes it) and transcript files,
+# The sandbox side of the interactive watcher, as shipped: the Python script
+# agentlab-run sends on ssh's stdin, run here against a stand-in session (its PID
+# in ~/.agentlab-session.pid, as the real launch writes it) and transcript files,
 # piped into agentlab-monitor --session as agentlab-run does. Its own PID
 # namespace keeps the tests' pkill away from anything else on this machine.
-WATCH="$(awk "/^WATCH_REMOTE='/ { f = 1; sub(/^WATCH_REMOTE='/, \"\") } f { print } f && /'\$/ { exit }" "$RUN" \
-  | sed "\$s/'\$//")"
-check "the session watcher script is found" grep -q 'tail --pid' <<<"$WATCH"
+WATCH="$(heredoc_body "<<'WATCH'" "$RUN" WATCH)"
+check "the session watcher script is found" grep -q 'HEARTBEAT' <<<"$WATCH"
 if unshare --pid --fork --mount-proc true 2>/dev/null; then
   watch_case() {   # watch_case NAME: prints "<monitor exit> <early|held>"
     local home="$TMP/$1"
@@ -158,14 +174,25 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
     WATCH="$WATCH" MONITOR="$REPO/linux/agentlab-monitor.py" CASE="$1" HOME="$home" \
       unshare --pid --fork --mount-proc bash -c '
         prompt() { printf "{\"type\": \"user\", \"permissionMode\": \"%s\", \"message\": {\"content\": \"hi\"}}\n" "$1"; }
+        big() {   # big FILE: 40 records of 200 kB, each in one write, as Claude Code writes them
+          python3 -I -c "import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+rec = (\"{\\\"type\\\": \\\"user\\\", \\\"permissionMode\\\": \\\"auto\\\", \\\"message\\\": {\\\"content\\\": \\\"\" + \"x\" * 200000 + \"\\\"}}\n\").encode()
+for _ in range(40):
+    os.write(fd, rec)" "$1"
+        }
         proj="$HOME/.claude/projects/-work-target"
+        watcher="^python3 -I -\$"   # how ssh starts it: exec python3 -I -
         until_seen() { for _ in $(seq 1 40); do grep -q "$1" "$HOME/out.jsonl" 2>/dev/null && return 0; sleep 0.25; done; return 1; }
         until_done() { for _ in $(seq 1 "$1"); do [ -s "$HOME/rc" ] && return 0; sleep 0.25; done; return 1; }
         [ "$CASE" = stale ] && { prompt default > "$proj/old.jsonl"; sleep 1.1; }
         "$HOME/bin/claude" 120 & claude=$!
         echo "$claude" > "$HOME/.agentlab-session.pid"
-        { bash -c "$WATCH" 2>/dev/null | python3 -I "$MONITOR" --session --quiet --out "$HOME/out.jsonl"
-          echo "${PIPESTATUS[1]}" > "$HOME/rc"; } &
+        # As agentlab-run does: the monitor reads a process substitution, so its
+        # exit counts at once, even while the watcher is paused.
+        { python3 -I "$MONITOR" --session --quiet --stall 3 --out "$HOME/out.jsonl" \
+            < <(python3 -I - <<<"$WATCH" 2>/dev/null)
+          echo "$?" > "$HOME/rc"; } &
         sleep 1.2                      # transcripts must be newer than the watcher
         prompt auto >> "$proj/new.jsonl"
         until_seen "\"auto\"" || { echo "never-followed"; kill "$claude"; exit; }
@@ -173,17 +200,22 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
           leaves) prompt acceptEdits >> "$proj/new.jsonl" ;;
           clear)  sleep 1.1; prompt plan >> "$proj/cleared.jsonl" ;;
           init)   echo "{\"type\": \"system\", \"subtype\": \"init\"}" >> "$proj/new.jsonl" ;;
-          kill)   pkill -x tail ;;
+          kill)   pkill -f "$watcher" ;;
           swap)   mv "$proj/new.jsonl" "$proj/new.bak"; ln -s /dev/null "$proj/new.jsonl" ;;
           delete) rm "$proj/new.jsonl" ;;
+          truncate) : > "$proj/new.jsonl" ;;
+          fifo)   mkfifo "$proj/pipe.jsonl" ;;
           decoy)  mkdir -p "$HOME/.claude/projects/x"
                   prompt auto > "$HOME/.claude/projects/x/d.jsonl"
                   touch -d @4102444800 "$HOME/.claude/projects/x/d.jsonl"
                   sleep 2.5; prompt acceptEdits >> "$proj/new.jsonl" ;;
-          stop)   pkill -STOP -x tail ;;
+          interleave)   # both followed first, then written at once (a shared pipe mixed these)
+                  prompt auto >> "$proj/other.jsonl"; sleep 2
+                  big "$proj/new.jsonl" & w1=$!; big "$proj/other.jsonl" & w2=$!; wait "$w1" "$w2" ;;
+          stop)   pkill -STOP -f "$watcher" ;;
         esac
         until_done 16 && when=early || when=held
-        kill "$claude"; pkill -CONT -x tail 2>/dev/null
+        kill "$claude"; pkill -CONT -f "$watcher" 2>/dev/null
         until_done 20
         echo "$(cat "$HOME/rc" 2>/dev/null || echo none) $when"'
   }
@@ -193,11 +225,17 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
   check "watcher: it follows the new transcript /clear starts" test "$(watch_case clear)" = "3 early"
   check "watcher: an init record written into the transcript stops it" test "$(watch_case init)" = "7 early"
   check "watcher: a decoy transcript can't hide the real one" test "$(watch_case decoy)" = "3 early"
-  for c in kill swap stop delete; do
+  out="$(watch_case interleave)"
+  check "watcher: large records from two transcripts written at once arrive whole [$out]" test "$out" = "0 held"
+  out="$(watch_case stop)"
+  check "watcher: a paused watcher goes quiet, and that stops it [$out]" test "$out" = "8 early"
+  for c in kill swap delete truncate fifo; do
     out="$(watch_case "$c")"
     check "watcher: tampering ($c) ends the watcher while the session runs [$out]" grep -q ' early$' <<<"$out"
   done
   check "watcher: the gateway keeps a copy of what it followed" grep -q '"permissionMode": "auto"' "$TMP/stays/out.jsonl"
+  check "watcher: the copy holds every large record whole" \
+    test "$(awk 'length($0) > 200000 { n++ } END { print n + 0 }' "$TMP/interleave/out.jsonl")" -eq 80
 else
   skip "PID namespaces unavailable here; skipping the session watcher"
 fi

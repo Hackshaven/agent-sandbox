@@ -564,6 +564,47 @@ class HostileInput(unittest.TestCase):
                 self.assertEqual(rc, 0, err)
                 self.assertEqual(written, data)
 
+    def test_invalid_utf8_inside_a_string_stops_a_session(self):
+        bad = stream(prompt("go")).encode().replace(b'"go"', b'"g\xffo"')
+        rc, written, err = self.run_monitor(bad + stream(prompt("more")).encode(), "--session")
+        self.assertEqual(rc, 7, err)
+        self.assertTrue(written.startswith(bad), "the evidence copy keeps the bad line byte for byte")
+        rc, _, err = self.run_monitor(stream(init()).encode() + bad)
+        self.assertEqual(rc, 0, "a headless stream reads past it")
+
+    def test_heartbeats_are_skipped_in_a_session(self):
+        beat = b'{"agentlab": "heartbeat"}\n'
+        data = beat + stream(prompt("go")).encode() + beat * 3
+        rc, written, err = self.run_monitor(data, "--session")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(written, stream(prompt("go")).encode(), "heartbeats aren't evidence")
+        rc, _, _ = self.run_monitor(beat * 3, "--session")
+        self.assertEqual(rc, 6, "heartbeats alone confirm nothing")
+
+    def test_a_watcher_that_goes_quiet_stops_the_session(self):
+        import time
+        beat = b'{"agentlab": "heartbeat"}\n'
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.jsonl")
+            argv = [sys.executable, "-I", MONITOR, "--out", out, "--quiet", "--session", "--stall", "1"]
+            p = subprocess.Popen(argv, stdin=subprocess.PIPE)
+            p.stdin.write(stream(prompt("go")).encode())
+            p.stdin.flush()
+            for _ in range(6):          # heartbeats keep it going past the stall time
+                time.sleep(0.3)
+                p.stdin.write(beat)
+                p.stdin.flush()
+            self.assertIsNone(p.poll(), "a beating watcher isn't stalled")
+            started = time.monotonic()
+            self.assertEqual(p.wait(timeout=10), 8)   # then it goes quiet with its pipe open
+            self.assertLess(time.monotonic() - started, 5)
+            p.stdin.close()
+            q = subprocess.Popen(argv, stdin=subprocess.PIPE)
+            q.stdin.write(stream(prompt("go")).encode()[:-10])   # quiet in the middle of a line
+            q.stdin.flush()
+            self.assertEqual(q.wait(timeout=10), 8)
+            q.stdin.close()
+
     def test_size_limits_stop_the_run(self):
         long_line = stream(prompt("x" * 500)).encode()
         self.assertEqual(self.run_monitor(long_line, "--session", "--max-line-bytes", "100")[0], 7)

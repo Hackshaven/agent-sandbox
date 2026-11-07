@@ -171,49 +171,167 @@ collect() {
 }
 # Interactive runs: a watcher follows the transcripts Claude Code writes on the
 # sandbox, through agentlab-monitor, and ends the session if it leaves auto mode,
-# spends the denial budget, or writes a line the monitor won't trust. The session
-# writes its own PID to ~/.agentlab-session.pid (cleared at delivery). The remote
-# side starts one tail on each transcript written since it started (/clear starts
-# a new one) and never stops one while its file lives, so a file the agent adds
-# can add lines but can't hide any. It exits, and so ends the gateway's view, if
-# no transcript appears within five minutes, or if a tail dies, is stopped, or has
-# its file deleted or swapped while the session runs. POSIX sh, one line per tail.
+# spends the denial budget, writes a line the monitor won't trust, or goes quiet.
+# The session writes its own PID to ~/.agentlab-session.pid (cleared at delivery).
+# The sandbox side is one Python process, sent on ssh's stdin. It follows every
+# transcript written since it started (/clear starts a new one) and never drops
+# one while its file lives, so a file the agent adds can add lines but can't hide
+# any. It is the feed's only writer and sends each record whole, so records from
+# two transcripts can't mix, plus a heartbeat every second. It exits, and so ends
+# the gateway's view, if no transcript appears within five minutes, if a followed
+# file is deleted, replaced or truncated, or if a new one isn't a regular file.
 # Everything on that side runs as agent, so the gateway treats any early end of
-# the watcher as a lost watcher and ends the session itself: a tripwire that fails
-# closed, not a control the agent can't touch.
-WATCH_REMOTE='t0="$(date +%s)"; pidfile="$HOME/.agentlab-session.pid"; p=""; known=""; idle=0
-nl="
-"
-for _ in $(seq 1 60); do [ -s "$pidfile" ] && p="$(cat "$pidfile")" && break; sleep 1; done
-case "$p" in ""|*[!0-9]*) exit 2 ;; esac
-IFS="$nl"
-while kill -0 "$p" 2>/dev/null; do
-  for f in $(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -name "*.jsonl" -newermt "@$t0" 2>/dev/null); do
-    case "$known" in *"|$f|"*) continue ;; esac
-    tail --pid="$p" -n +1 -F "$f" 2>/dev/null &
-    known="$known$!|$f|$(stat -c %i "$f")$nl"
-    echo "following $f" >&2
-  done
-  if [ -z "$known" ]; then idle=$((idle + 1)); [ "$idle" -ge 300 ] && exit 6; fi
-  printf %s "$known" | {
-    rc=0
-    while IFS="|" read -r t f ino; do
-      if ! kill -0 "$t" 2>/dev/null; then kill -0 "$p" 2>/dev/null && rc=3; break; fi
-      case "$(ps -o stat= -p "$t" 2>/dev/null)" in T*) rc=4; break ;; esac
-      [ "$(stat -c %i "$f" 2>/dev/null)" = "$ino" ] || { rc=5; break; }
-    done
-    exit "$rc"
-  }
-  rc=$?
-  if [ "$rc" != 0 ]; then
-    printf %s "$known" | while IFS="|" read -r t _; do kill -KILL "$t" 2>/dev/null; done
-    exit "$rc"
-  fi
-  sleep 1
-done
-wait
-exit 0'
+# the watcher, or WATCH_STALL seconds with nothing from it, as a lost watcher and
+# ends the session itself: a tripwire that fails closed, not a control the agent
+# can't touch.
+read -r -d '' WATCH_REMOTE <<'WATCH' || true
+import os
+import stat
+import sys
+import time
+
+HEARTBEAT = b'{"agentlab": "heartbeat"}\n'   # agentlab-monitor --session skips exactly this
+MAX_LINE = 16 * 1024 * 1024                  # agentlab-monitor stops on a longer line
+MAX_FILES = 256
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+PIDFILE = os.path.join(HOME, ".agentlab-session.pid")
+T0 = int(time.time())
+followed = {}   # path -> [fd, (dev, inode), bytes read, the line still being written]
+
+
+def send(data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(1, view):]
+
+
+def say(text):
+    os.write(2, (text + "\n").encode("utf-8", "backslashreplace"))
+
+
+def leave(code, why):
+    say("watcher: " + why)
+    sys.exit(code)
+
+
+def running(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, OverflowError):
+        return False
+
+
+def discover():
+    """Follow each .jsonl file in ~/.claude/projects/<dir>/ written since T0."""
+    try:
+        dirs = [d for d in os.scandir(PROJECTS) if d.is_dir(follow_symlinks=False)]
+    except OSError:
+        return
+    for d in dirs:
+        try:
+            entries = list(os.scandir(d.path))
+        except OSError:
+            continue
+        for e in entries:
+            if not e.name.endswith(".jsonl") or e.path in followed:
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_mtime <= T0:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                leave(5, "%s isn't a regular file" % e.path)
+            if len(followed) >= MAX_FILES:
+                leave(7, "more than %d transcripts" % MAX_FILES)
+            try:
+                fd = os.open(e.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError:
+                continue
+            fst = os.fstat(fd)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                os.close(fd)
+                continue
+            followed[e.path] = [fd, (st.st_dev, st.st_ino), 0, bytearray()]
+            say("following " + e.path)
+
+
+def read_new(entry):
+    """Send each line finished since the last read, whole."""
+    fd, _, _, line = entry
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            return
+        entry[2] += len(chunk)
+        line += chunk
+        end = line.rfind(b"\n") + 1
+        if end:
+            send(line[:end])
+            del line[:end]
+        if len(line) > MAX_LINE:   # the monitor stops on a line this long, so pass it on
+            send(line)
+            del line[:]
+
+
+def check(path, entry):
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        leave(5, "%s was deleted" % path)
+    if (st.st_dev, st.st_ino) != entry[1]:
+        leave(5, "%s was replaced" % path)
+    if os.fstat(entry[0]).st_size < entry[2]:
+        leave(5, "%s was truncated" % path)
+
+
+def main():
+    send(HEARTBEAT)
+    pid = None
+    for _ in range(60):
+        try:
+            with open(PIDFILE, "rb") as f:
+                text = f.read(64).strip()
+        except OSError:
+            text = b""
+        if text:
+            if not text.isdigit():
+                leave(2, "the session's PID file holds no PID")
+            pid = int(text)
+            break
+        time.sleep(1)
+        send(HEARTBEAT)
+    if pid is None:
+        leave(2, "the session never wrote its PID")
+    started = time.monotonic()
+    while running(pid):
+        discover()
+        for path, entry in list(followed.items()):
+            read_new(entry)   # what the file holds, then whether it's still the same file
+            check(path, entry)
+        if not followed and time.monotonic() - started > 300:
+            leave(6, "no transcript appeared within five minutes")
+        send(HEARTBEAT)
+        time.sleep(1)
+    discover()   # the session has ended: send what's left, once
+    for entry in followed.values():
+        read_new(entry)
+        if entry[3]:
+            send(bytes(entry[3]) + b"\n")
+
+
+try:
+    main()
+except BrokenPipeError:   # the gateway stopped reading
+    sys.exit(1)
+WATCH
 SESSION_FLAG="$RUN_DIR/.session-running"
+WATCH_FEED="$RUN_DIR/.watch-feed.pid"
+WATCH_STALL=30   # seconds with nothing from the watcher (it beats every second) before it's lost
+WATCH_GRACE=10   # seconds the watcher gets to finish once the session has ended
 watch_pid=""
 end_session() {   # end_session REASON: stop the interactive session from the gateway side
   echo "watch_stop=$1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
@@ -225,34 +343,44 @@ end_session() {   # end_session REASON: stop the interactive session from the ga
     "-t agent@${SBX//./\\.} .*\\.agentlab-session\\.pid" 2>/dev/null || true; }
   wait "$sr" 2>/dev/null || true
 }
+kill_feed() {   # end the watcher's ssh (its timeout passes the signal on), if it's still up
+  [[ -s "$WATCH_FEED" ]] && kill "$(cat "$WATCH_FEED")" 2>/dev/null
+  return 0
+}
 watch_session() {   # runs in the background for the length of an interactive session
   set +e
-  local feed="$RUN_DIR/.watch-ssh.pid" mrc
+  local mrc
   # A process substitution, so the monitor's exit acts at once rather than when
-  # ssh next writes. The feed records its ssh's PID, which $! can't give here.
-  agentlab-monitor --session --quiet --log "$RUN_DIR/session-monitor.log" \
+  # ssh next writes. The feed records its timeout's PID, which $! can't give
+  # here; the timeout is the gateway's own deadline on it, past the session's.
+  agentlab-monitor --session --quiet --stall "$WATCH_STALL" --log "$RUN_DIR/session-monitor.log" \
     --out "$RUN_DIR/session-transcript.jsonl" 2>>"$RUN_DIR/session-monitor.log" \
-    < <(ssh "${SSH_OPTS[@]}" "agent@$SBX" "$WATCH_REMOTE" < /dev/null \
-          2> >(head -c 1048576 >> "$RUN_DIR/watch.log") &
-        echo "$!" > "$feed"; wait "$!"
+    < <(timeout -k 5 "$((time_s + 180))" ssh "${SSH_OPTS[@]}" "agent@$SBX" 'exec python3 -I -' \
+          <<<"$WATCH_REMOTE" 2> >(head -c 1048576 >> "$RUN_DIR/watch.log") &
+        echo "$!" > "$WATCH_FEED"; wait "$!"
         echo "watch_remote_exit=$? at=$(date -Is)" >> "$RUN_DIR/meta.txt")
   mrc=$?
   echo "watch_exit=$mrc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  kill_feed   # nothing reads it now
   case $mrc in
-    3|4|7) end_session "the monitor stopped it (exit $mrc)"
-           [[ -s "$feed" ]] && kill "$(cat "$feed")" 2>/dev/null ;;
+    3|4|7|8) end_session "the monitor stopped it (exit $mrc)" ;;
     *) # The watcher stopped reading. If the session is still up, nothing is watching it.
        for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || break; sleep 1; done
        [[ -e "$SESSION_FLAG" ]] && end_session "the watcher ended (exit $mrc) while the session ran" ;;
   esac
-  rm -f "$feed"
   return 0
 }
 stop_watch() {   # let the watcher finish once the session has ended, then make sure it has
   [[ -n "$watch_pid" ]] || return 0
-  for _ in $(seq 1 10); do kill -0 "$watch_pid" 2>/dev/null || break; sleep 1; done
+  for _ in $(seq 1 "$WATCH_GRACE"); do kill -0 "$watch_pid" 2>/dev/null || break; sleep 1; done
+  if ! grep -q '^watch_exit=' "$RUN_DIR/meta.txt" 2>/dev/null; then   # still reading
+    echo "watch_unfinished=1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+    kill_feed   # its end of file lets the monitor, and watch_session, finish
+    for _ in 1 2 3 4 5; do kill -0 "$watch_pid" 2>/dev/null || break; sleep 1; done
+  fi
   pkill -TERM -P "$watch_pid" 2>/dev/null || true
   wait "$watch_pid" 2>/dev/null || true
+  kill_feed; rm -f "$WATCH_FEED"
 }
 on_signal() {   # on_signal NAME CODE: stop the agent and keep the evidence
   [[ $1 == HUP ]] && exec > /dev/null 2>&1   # the operator's terminal is gone
@@ -305,19 +433,22 @@ if [[ -n "$watch_pid" ]]; then
   stop_watch
   watch_rc="$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
   watch_stop="$(sed -n 's/^watch_stop=\(.*\) at=.*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
+  watch_unfinished="$(grep -c '^watch_unfinished=' "$RUN_DIR/meta.txt" || true)"
   [[ -n "$watch_stop" ]] && note "The watcher ended the session: $watch_stop."
+  [[ "$watch_unfinished" != 0 ]] && note "The watcher hadn't finished ${WATCH_GRACE}s after the session ended, so its last records were checked only by the scan below."
   case "$watch_rc" in
     0) ;;
     3) note "Stopped: a prompt was sent outside auto mode." ;;
     4) note "Stopped: denial budget spent." ;;
     6) note "The session transcript never confirmed auto mode." ;;
     7) note "Stopped: the session transcript had a line the monitor won't trust." ;;
+    8) note "Stopped: nothing came from the watcher for ${WATCH_STALL}s, so nothing was watching." ;;
     "") note "The watcher left no result, so treat the session as unwatched." ;;
     *) note "The watcher ended with exit $watch_rc, so treat the session as unwatched." ;;
   esac
   [[ -s "$RUN_DIR/session-monitor.log" ]] && note "The watcher's view: $RUN_DIR/session-monitor.log"
   if [[ "$watch_rc" != 0 ]]; then rc="${watch_rc:-1}"
-  elif [[ -n "$watch_stop" ]]; then rc=8; fi
+  elif [[ -n "$watch_stop" || "$watch_unfinished" != 0 ]]; then rc=8; fi
 fi
 collect
 

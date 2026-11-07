@@ -125,21 +125,22 @@ Add `-Interactive` for a supervised session instead. It's recorded on the gatewa
 and `agentlab-monitor` follows its transcript and ends the session if a prompt is
 sent outside auto mode (switching to plan or accept-edits mode ends it too), the
 denial budget runs out, the transcript holds a line the monitor won't trust, or
-the watcher stops reading while the session runs. It follows the new transcript
-`/clear` starts. The watcher runs as the agent on the sandbox, so treat it as a
-tripwire, not a guard: keep watching the session.
+the watcher stops reading or goes quiet for 30 seconds while the session runs. It
+follows the new transcript `/clear` starts. The watcher runs as the agent on the
+sandbox, so treat it as a tripwire, not a guard: keep watching the session.
 
 Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
 (headless) or `session.log`, `session-transcript.jsonl`, `session-monitor.log` and
 `watch.log` (interactive), `claude-projects.tgz`, `credproxy.new.log`,
 `egress-deny.new.log` and `scan.txt`. `meta.txt` records how the run ended:
 `remote_exit` and `monitor_exit` for a headless run; `session_exit`,
-`watch_exit`, any `watch_stop` reason and, when the watcher's ssh has ended,
-`watch_remote_exit` for an interactive one; `interrupted` after Ctrl+C, a closed
+`watch_exit`, any `watch_stop` reason, `watch_unfinished` if the watcher was
+still reading 10 seconds after the session ended and, when the watcher's ssh has
+ended, `watch_remote_exit` for an interactive one; `interrupted` after Ctrl+C, a closed
 window or a TERM; and `projects_tgz_exit` for the evidence pull. The run's exit
 code says how it ended: 0 finished, 3 not in auto mode, 4 denial budget spent,
 5 no init message, 6 auto mode not confirmed, 7 a transcript line the monitor
-won't trust, 8 the watcher was lost, 124 or 137 the time limit, 129, 130 or 143
+won't trust, 8 the watcher was lost or went quiet, 124 or 137 the time limit, 129, 130 or 143
 interrupted.
 Folders older than 45 days are pruned. The files are kept byte for byte,
 including whatever the agent wrote, so read them with `less` (not `less -R`) or
