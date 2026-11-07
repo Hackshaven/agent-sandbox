@@ -162,3 +162,7 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
   that `/etc/claude-code/managed-settings.json` is read (the sandbox check tests
   this).
 - This is your everyday laptop, not a dedicated host. Keep runs short and watched.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
