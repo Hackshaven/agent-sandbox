@@ -22,9 +22,12 @@ all, or with --session, a line that isn't a transcript record or isn't valid
 UTF-8), 8 nothing arrived for --stall seconds.
 
 With --session, the watcher agentlab-run starts on the sandbox sends a
-heartbeat line every second, which is skipped (not copied to --out), so with
---stall a watcher that freezes stops the run too. The agent runs that watcher
-and could forge heartbeats, as it could forge any line. The watcher sends only
+heartbeat line after each pass over the transcripts (about once a second),
+which is skipped (not copied to --out) but counts toward --max-total-bytes.
+With --session, --stall times the gap between heartbeats, not between lines, so
+a watcher that freezes, or is held on one file, stops the run. The agent owns
+that watcher, which makes itself undumpable so its output can't be opened
+through /proc; a heartbeat is still a claim from the agent's side, not proof. The watcher sends only
 finished records, so a line cut off by the end of the feed (the gateway or the
 connection ending it) is kept in --out but not read, and doesn't stop the run.
 
@@ -135,8 +138,8 @@ def main():
     ap.add_argument("--max-line-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--max-total-bytes", type=int, default=1024 * 1024 * 1024)
     ap.add_argument("--stall", type=int, default=0,
-                    help="stop (exit 8) if no line, heartbeat included, arrives for this many "
-                         "seconds; 0, the default, waits for ever")
+                    help="stop (exit 8) if no heartbeat (with --session) or no line (without) "
+                         "arrives for this many seconds; 0, the default, waits for ever")
     ap.add_argument("--log", help="write the view to this file instead of the terminal")
     ap.add_argument("--quiet", action="store_true", help="no terminal view")
     args = ap.parse_args()
@@ -243,14 +246,19 @@ def main():
 
     stdin = sys.stdin.buffer
 
+    deadline = [time.monotonic() + args.stall]   # when --stall runs out
+
     def next_line():
         if not args.stall:
             return stdin.readline(args.max_line_bytes + 1)
-        signal.alarm(args.stall)   # a stalled read raises Stalled; nothing else is timed
+        left = deadline[0] - time.monotonic()
+        if left <= 0:
+            raise Stalled()
+        signal.setitimer(signal.ITIMER_REAL, left)   # a stalled read raises Stalled
         try:
             return stdin.readline(args.max_line_bytes + 1)
         finally:
-            signal.alarm(0)
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
     if args.stall:
         signal.signal(signal.SIGALRM, on_alarm)
@@ -266,7 +274,8 @@ def main():
             try:
                 raw = next_line()
             except Stalled:
-                show(f"  ! STOP: no complete line for {args.stall} seconds, so nothing is watching "
+                show(f"  ! STOP: no {'heartbeat' if args.session else 'line'} for {args.stall} seconds, "
+                     "so nothing is watching "
                      f"(last record {when(heard['record'])}, last heartbeat {when(heard['heartbeat'])}, "
                      f"{lineno} records)")
                 return 8
@@ -274,8 +283,15 @@ def main():
                 break
             if args.session and raw == HEARTBEAT:
                 heard["heartbeat"] = time.time()
+                deadline[0] = time.monotonic() + args.stall
+                total += len(raw)
+                if total > args.max_total_bytes:
+                    show(f"  ! STOP: input passed {args.max_total_bytes} bytes")
+                    return 7
                 continue
             heard["record"] = time.time()
+            if not args.session:
+                deadline[0] = time.monotonic() + args.stall
             out.write(raw)
             out.flush()
             lineno += 1

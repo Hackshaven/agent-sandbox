@@ -402,7 +402,7 @@ def data_of(member):
     """What extractfile needs to read a regular member again, without its headers."""
     t = tarfile.TarInfo(member.name[:MAX_NAME])
     t.type = tarfile.REGTYPE
-    t.size, t.offset, t.offset_data, t.sparse = member.size, member.offset, member.offset_data, member.sparse
+    t.size, t.offset, t.offset_data = member.size, member.offset, member.offset_data
     return t
 
 
@@ -438,8 +438,13 @@ def scan_archive(path):
                 if count > MAX_MEMBERS + MAX_LISTED:
                     stop += f", and the archive goes on past {MAX_MEMBERS + MAX_LISTED} members"
                     break
-                if member.isfile():
+                if stop is None and member.isfile() and not member.issparse():
                     regular[name_key(member.name)] = data_of(member)
+                if stop is None and member.issym() and not member.name.endswith(".jsonl"):
+                    yield f"{path}:{member.name}", finding(
+                        "linked-member", "member",
+                        f"a symbolic link to {member.linkname[:200]}; what it points to wasn't collected")
+                    continue
                 if not member.name.endswith(".jsonl"):
                     continue
                 found += 1
@@ -453,12 +458,16 @@ def scan_archive(path):
                     key = name_key(member.linkname)
                     data = regular.get(key)
                     if data is None:
-                        yield label, finding("unreadable-line", "member", "a hard link to no file before it")
+                        yield label, finding("unreadable-line", "member",
+                                             "a hard link to no regular file before it")
                         continue
                     if key in scanned:
                         yield label, finding("linked-member", "member",
                                              f"a hard link to data already scanned as {scanned[key]}")
                         continue
+                elif member.issparse():   # tar -czf never writes one, and its map can be huge
+                    yield label, finding("unreadable-line", "member", "a sparse file, not read")
+                    continue
                 elif member.isfile():
                     key, data = name_key(member.name), regular[name_key(member.name)]
                 else:

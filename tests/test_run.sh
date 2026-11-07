@@ -172,11 +172,16 @@ fi
 WATCH="$(heredoc_body "<<'WATCH'" "$RUN" WATCH)"
 check "the session watcher script is found" grep -q 'HEARTBEAT' <<<"$WATCH"
 if unshare --pid --fork --mount-proc true 2>/dev/null; then
+  # The stand-in session and the watcher run as nobody, as the agent's are not
+  # root, so a folder or file made unreadable is unreadable to the watcher too.
+  AS=""
+  command -v setpriv >/dev/null && AS="setpriv --reuid=65534 --regid=65534 --clear-groups"
   watch_case() {   # watch_case NAME: prints "<monitor exit> <early|held>"
     local home="$TMP/$1"
     mkdir -p "$home/bin" "$home/.claude/projects/-work-target"
     cp "$(command -v sleep)" "$home/bin/claude"
-    WATCH="$WATCH" MONITOR="$REPO/linux/agentlab-monitor.py" CASE="$1" HOME="$home" \
+    chmod 755 "$TMP" "$home"
+    AS="$AS" WATCH="$WATCH" MONITOR="$REPO/linux/agentlab-monitor.py" CASE="$1" HOME="$home" \
       unshare --pid --fork --mount-proc bash -c '
         prompt() { printf "{\"type\": \"user\", \"permissionMode\": \"%s\", \"message\": {\"content\": \"hi\"}}\n" "$1"; }
         big() {   # big FILE: 40 records of 200 kB, each in one write, as Claude Code writes them
@@ -191,12 +196,12 @@ for _ in range(40):
         until_seen() { for _ in $(seq 1 40); do grep -q "$1" "$HOME/out.jsonl" 2>/dev/null && return 0; sleep 0.25; done; return 1; }
         until_done() { for _ in $(seq 1 "$1"); do [ -s "$HOME/rc" ] && return 0; sleep 0.25; done; return 1; }
         [ "$CASE" = stale ] && { prompt default > "$proj/old.jsonl"; sleep 1.1; }
-        "$HOME/bin/claude" 120 & claude=$!
+        $AS "$HOME/bin/claude" 120 & claude=$!
         echo "$claude" > "$HOME/.agentlab-session.pid"
         # As agentlab-run does: the monitor reads a process substitution, so its
         # exit counts at once, even while the watcher is paused.
         { python3 -I "$MONITOR" --session --quiet --stall 3 --out "$HOME/out.jsonl" \
-            < <(python3 -I - <<<"$WATCH" 2>/dev/null)
+            < <($AS python3 -I - <<<"$WATCH" 2>/dev/null)
           echo "$?" > "$HOME/rc"; } &
         sleep 1.2                      # transcripts must be newer than the watcher
         prompt auto >> "$proj/new.jsonl"
@@ -210,6 +215,9 @@ for _ in range(40):
           delete) rm "$proj/new.jsonl" ;;
           truncate) : > "$proj/new.jsonl" ;;
           fifo)   mkfifo "$proj/pipe.jsonl" ;;
+          dirlink) mv "$proj" "$HOME/real"; ln -s "$HOME/real" "$proj" ;;
+          unreadable) chmod 711 "$proj" ;;              # listable by no one but root
+          writeonly) install -m 200 /dev/null "$proj/w.jsonl" ;;
           decoy)  mkdir -p "$HOME/.claude/projects/x"
                   prompt auto > "$HOME/.claude/projects/x/d.jsonl"
                   touch -d @4102444800 "$HOME/.claude/projects/x/d.jsonl"
@@ -238,7 +246,9 @@ for _ in range(40):
   check "watcher: a paused watcher goes quiet, and that stops it [$out]" test "$out" = "8 early"
   out="$(watch_case partial)"
   check "watcher: a record left unfinished at the end isn't sent as a line [$out]" test "$out" = "0 held"
-  for c in kill swap delete truncate fifo beatline; do
+  hiding="dirlink"
+  [[ -n "$AS" ]] && hiding="dirlink unreadable writeonly" || skip "no setpriv: the unreadable-file cases need a non-root watcher"
+  for c in kill swap delete truncate fifo beatline $hiding; do
     out="$(watch_case "$c")"
     check "watcher: tampering ($c) ends the watcher while the session runs [$out]" grep -q ' early$' <<<"$out"
   done

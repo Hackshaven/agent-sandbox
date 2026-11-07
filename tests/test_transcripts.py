@@ -288,7 +288,7 @@ class ScanRules(unittest.TestCase):
                                     links=[("p/s.jsonl", tarfile.LNKTYPE, "p/missing.txt")])
             (label, (hits, *_)), = list(scan.scan_archive(tgz))
         self.assertEqual(hits[0][1], "unreadable-line")
-        self.assertIn("a hard link to no file before it", hits[0][3])
+        self.assertIn("a hard link to no regular file before it", hits[0][3])
 
     def test_invalid_utf8_is_reported_and_still_scanned(self):
         line = json.dumps(call(1, "Bash", command="ping 10.77.0.1")).encode().replace(b"ping", b"\xffping")
@@ -350,6 +350,26 @@ class ScanRules(unittest.TestCase):
                 restore()
         self.assertEqual(found[-1][1][0][0][1], "scan-incomplete")
         self.assertIn("3 more transcripts went unscanned: p/z1.jsonl, p/z2.jsonl, p/z3.jsonl", found[-1][1][0][0][3])
+
+    def test_sparse_members_and_linked_folders_are_reported_not_read(self):
+        import io
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tgz = os.path.join(d, "claude-projects.tgz")
+            with tarfile.open(tgz, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+                data = stream(call(1, "Bash", command="ping 10.77.0.1")).encode()
+                info = tarfile.TarInfo("p/s.jsonl")
+                info.size = len(data)
+                info.pax_headers = {"GNU.sparse.map": "0,%d" % len(data), "GNU.sparse.size": str(len(data))}
+                tar.addfile(info, io.BytesIO(data))
+                link = tarfile.TarInfo("p/-work-target")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "/tmp/hidden"
+                tar.addfile(link)
+            found = dict(scan.scan_archive(tgz))
+        texts = [h[3] for hits, *_ in found.values() for h in hits]
+        self.assertIn("a sparse file, not read", texts)
+        self.assertTrue(any("a symbolic link to /tmp/hidden" in t for t in texts), texts)
 
     def test_hits_come_first(self):
         with tempfile.TemporaryDirectory() as d:
@@ -636,6 +656,29 @@ class HostileInput(unittest.TestCase):
         self.assertEqual(written, stream(prompt("go")).encode(), "heartbeats aren't evidence")
         rc, _, _ = self.run_monitor(beat * 3, "--session")
         self.assertEqual(rc, 6, "heartbeats alone confirm nothing")
+
+    def test_in_a_session_only_heartbeats_hold_off_the_stall(self):
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.jsonl")
+            p = subprocess.Popen([sys.executable, "-I", MONITOR, "--out", out, "--quiet", "--session",
+                                  "--stall", "1"], stdin=subprocess.PIPE)
+            started = time.monotonic()
+            try:
+                while p.poll() is None and time.monotonic() - started < 6:   # records, no heartbeats
+                    p.stdin.write(stream(prompt("go")).encode())
+                    p.stdin.flush()
+                    time.sleep(0.2)
+            except BrokenPipeError:
+                pass
+            self.assertEqual(p.wait(timeout=10), 8, "records alone don't show the watcher is whole")
+            self.assertLess(time.monotonic() - started, 4)
+
+    def test_heartbeats_count_toward_the_byte_budget(self):
+        beat = b'{"agentlab": "heartbeat"}\n'
+        rc, _, _ = self.run_monitor(stream(prompt("go")).encode() + beat * 100,
+                                    "--session", "--max-total-bytes", "1000")
+        self.assertEqual(rc, 7)
 
     def test_a_line_cut_off_by_the_end_of_the_feed_is_kept_not_read(self):
         cut = stream(prompt("next", "acceptEdits")).encode()[:-20]

@@ -177,18 +177,24 @@ collect() {
 # transcript written since it started (/clear starts a new one) and never drops
 # one while its file lives, so a file the agent adds can add lines but can't hide
 # any. It is the feed's only writer and sends each record whole, so records from
-# two transcripts can't mix, plus a heartbeat every second. It exits, and so ends
-# the gateway's view: 2 if the session never wrote its PID, 5 if a followed file
-# is deleted, replaced, truncated or holds a heartbeat line, or a new one isn't a
-# regular file, 6 if no transcript appears within five minutes, 7 past 256
-# transcripts, 0 once the session has ended and every finished record is sent. A
-# record still unfinished then (a time-limit kill mid-write) isn't sent; its file
-# and size go to watch.log, and the copy in claude-projects.tgz is scanned.
+# two transcripts can't mix. It works in passes: look for new transcripts, read at
+# most 1 MiB of each, check each is still the file it opened, then send a
+# heartbeat, so a heartbeat means a whole pass finished and a growing decoy can't
+# hold it on one file. It makes itself undumpable, so the agent can't open its
+# output through /proc to forge one. It exits, and so ends the gateway's view: 2
+# if the session never wrote its PID, 5 if ~/.claude, its projects folder or a
+# project folder is a symbolic link or can't be read, if a followed file is
+# deleted, replaced, truncated or holds a heartbeat line, or if a new one isn't a
+# regular file or can't be opened, 6 if no transcript appears within five minutes,
+# 7 past 256 transcripts, 0 once the session has ended and every finished record
+# is sent. A record still unfinished then (a time-limit kill mid-write) isn't sent;
+# its file and size go to watch.log, and the copy in claude-projects.tgz is scanned.
 # Everything on that side runs as agent, so the gateway treats any early end of
 # the watcher, or WATCH_STALL seconds with nothing from it, as a lost watcher and
 # ends the session itself: a tripwire that fails closed, not a control the agent
 # can't touch.
 read -r -d '' WATCH_REMOTE <<'WATCH' || true
+import ctypes
 import os
 import stat
 import sys
@@ -197,6 +203,7 @@ import time
 HEARTBEAT = b'{"agentlab": "heartbeat"}\n'   # agentlab-monitor --session skips exactly this
 MAX_LINE = 16 * 1024 * 1024                  # agentlab-monitor stops on a longer line
 MAX_FILES = 256
+PASS_BYTES = 1024 * 1024                     # read from each transcript per pass
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
 PIDFILE = os.path.join(HOME, ".agentlab-session.pid")
@@ -228,23 +235,46 @@ def running(pid):
         return False
 
 
-def discover():
-    """Follow each .jsonl file in ~/.claude/projects/<dir>/ written since T0."""
+def real_dir(path):
+    """True if path is a directory, False if it doesn't exist; leaves on a link."""
     try:
-        dirs = [d for d in os.scandir(PROJECTS) if d.is_dir(follow_symlinks=False)]
-    except OSError:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        leave(5, "%s can't be read: %s" % (ascii(path), e.strerror))
+    if not stat.S_ISDIR(st.st_mode):
+        leave(5, "%s isn't a folder (a symbolic link?)" % ascii(path))
+    return True
+
+
+def listing(path):
+    """The entries of a folder this watcher must be able to read, or none if it's gone."""
+    try:
+        return list(os.scandir(path))
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        leave(5, "%s can't be read: %s" % (ascii(path), e.strerror))
+
+
+def discover():
+    """Follow each .jsonl file in ~/.claude/projects/<dir>/ written since T0. Anything
+    that could keep a new transcript out of sight (a link, a folder or file this
+    watcher can't read) ends the watch instead."""
+    if not real_dir(os.path.dirname(PROJECTS)) or not real_dir(PROJECTS):
         return
-    for d in dirs:
-        try:
-            entries = list(os.scandir(d.path))
-        except OSError:
+    for d in listing(PROJECTS):
+        if d.is_symlink():
+            leave(5, "%s is a symbolic link" % ascii(d.path))
+        if not d.is_dir(follow_symlinks=False):
             continue
-        for e in entries:
+        for e in listing(d.path):
             if not e.name.endswith(".jsonl") or e.path in followed:
                 continue
             try:
                 st = e.stat(follow_symlinks=False)
-            except OSError:
+            except FileNotFoundError:
                 continue
             if st.st_mtime <= T0:
                 continue
@@ -254,12 +284,13 @@ def discover():
                 leave(7, "more than %d transcripts" % MAX_FILES)
             try:
                 fd = os.open(e.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError as err:
+                leave(5, "%s can't be opened: %s" % (ascii(e.path), err.strerror))
             fst = os.fstat(fd)
             if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
-                os.close(fd)
-                continue
+                leave(5, "%s was replaced as it was opened" % ascii(e.path))
             followed[e.path] = [fd, (st.st_dev, st.st_ino), 0, bytearray()]
             say("following %s" % ascii(e.path))
 
@@ -271,13 +302,16 @@ def forward(path, block):
     send(block)
 
 
-def read_new(path, entry):
-    """Send each line finished since the last read, whole."""
+def read_new(path, entry, limit=PASS_BYTES):
+    """Send each line finished since the last read, whole, reading at most limit
+    bytes. Returns True if there may be more to read."""
     fd, _, _, line = entry
-    while True:
-        chunk = os.read(fd, 1 << 20)
+    left = limit
+    while left > 0:
+        chunk = os.read(fd, min(left, 1 << 20))
         if not chunk:
-            return
+            return False
+        left -= len(chunk)
         entry[2] += len(chunk)
         line += chunk
         end = line.rfind(b"\n") + 1
@@ -287,6 +321,7 @@ def read_new(path, entry):
         if len(line) > MAX_LINE:   # the monitor stops on a line this long, so pass it on
             send(line)
             del line[:]
+    return True
 
 
 def check(path, entry):
@@ -300,7 +335,27 @@ def check(path, entry):
         leave(5, "%s was truncated" % ascii(path))
 
 
+def undumpable():
+    """So the agent, same user, can't open this process's output through /proc."""
+    try:
+        if ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) != 0:   # PR_SET_DUMPABLE
+            say("watcher: couldn't make itself undumpable")
+    except (OSError, AttributeError):
+        say("watcher: couldn't make itself undumpable")
+
+
+def one_pass(checking=True):
+    """Read every transcript once, up to PASS_BYTES each; True if any has more."""
+    more = False
+    for path, entry in list(followed.items()):
+        more = read_new(path, entry) or more   # what the file holds, then whether
+        if checking:                           # it's still the same file
+            check(path, entry)
+    return more
+
+
 def main():
+    undumpable()
     send(HEARTBEAT)
     pid = None
     for _ in range(60):
@@ -321,16 +376,16 @@ def main():
     started = time.monotonic()
     while running(pid):
         discover()
-        for path, entry in list(followed.items()):
-            read_new(path, entry)   # what the file holds, then whether it's still the same file
-            check(path, entry)
+        more = one_pass()
         if not followed and time.monotonic() - started > 300:
             leave(6, "no transcript appeared within five minutes")
+        send(HEARTBEAT)   # a whole pass, checks included, has finished
+        if not more:
+            time.sleep(1)
+    discover()   # the session has ended: send what's left
+    while one_pass(checking=False):
         send(HEARTBEAT)
-        time.sleep(1)
-    discover()   # the session has ended: send what's left, once
     for path, entry in followed.items():
-        read_new(path, entry)
         if entry[3]:
             say("%s ends partway through a record (%d bytes), not sent" % (ascii(path), len(entry[3])))
     say("the session has ended")
@@ -372,8 +427,8 @@ watch_session() {   # runs in the background for the length of an interactive se
     --out "$RUN_DIR/session-transcript.jsonl" 2>>"$RUN_DIR/session-monitor.log" \
     < <(timeout -k 5 "$((time_s + 180))" ssh "${SSH_OPTS[@]}" "agent@$SBX" 'exec python3 -I -' \
           <<<"$WATCH_REMOTE" 2> >(head -c 1048576 >> "$RUN_DIR/watch.log") &
-        echo "$!" > "$WATCH_FEED"; wait "$!"
-        echo "watch_remote_exit=$? at=$(date -Is)" >> "$RUN_DIR/meta.txt")
+        echo "$!" > "$WATCH_FEED"; wait "$!"; feed_rc=$?; : > "$WATCH_FEED"   # gone: forget its PID
+        echo "watch_remote_exit=$feed_rc at=$(date -Is)" >> "$RUN_DIR/meta.txt")
   mrc=$?
   echo "watch_exit=$mrc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
   kill_feed   # nothing reads it now
@@ -462,8 +517,11 @@ if [[ -n "$watch_pid" ]]; then
     *) note "The watcher ended with exit $watch_rc, so treat the session as unwatched." ;;
   esac
   [[ -s "$RUN_DIR/session-monitor.log" ]] && note "The watcher's view: $RUN_DIR/session-monitor.log"
-  if [[ "$watch_rc" != 0 ]]; then rc="${watch_rc:-1}"
-  elif [[ -n "$watch_stop" || "$watch_unfinished" != 0 ]]; then rc=8; fi
+  case "$watch_rc" in
+    3|4|7|8) rc="$watch_rc" ;;
+    *) if [[ -n "$watch_stop" || "$watch_unfinished" != 0 ]]; then rc=8   # lost, even unconfirmed
+       elif [[ "$watch_rc" != 0 ]]; then rc="${watch_rc:-1}"; fi ;;
+  esac
 fi
 collect
 

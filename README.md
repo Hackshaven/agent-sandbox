@@ -125,8 +125,9 @@ Add `-Interactive` for a supervised session instead. It's recorded on the gatewa
 and `agentlab-monitor` follows its transcript and ends the session if a prompt is
 sent outside auto mode (switching to plan or accept-edits mode ends it too), the
 denial budget runs out, the transcript holds a line the monitor won't trust, or
-the watcher ends, or sends nothing (not even its once-a-second heartbeat) for 30
-seconds, while the session runs. It follows the new transcript `/clear` starts.
+the watcher ends, or sends no heartbeat (it sends one about every second) for 30
+seconds, while the session runs. It follows the new transcript `/clear` starts,
+and ends the session if a transcript or its folder is made unreadable or a link.
 The watcher runs as the agent on the sandbox, so treat it as a tripwire, not a
 guard: keep watching the session.
 
