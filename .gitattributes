@@ -1,0 +1,9 @@
+# Scripts that run on Linux must keep LF endings, even when cloned on Windows.
+linux/**     text eol=lf
+tests/**     text eol=lf
+templates/** text eol=lf
+*.sh         text eol=lf
+*.py         text eol=lf
+*.md         text
+*.svg        text
+*.ps1        text

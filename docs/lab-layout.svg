@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 496" role="img" aria-label="Only model calls leave the sandbox, and only through the gateway" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="13">
+  <style>
+    .bg { fill: #ffffff; }
+    .ink { fill: #1f2328; }
+    .quiet { fill: #59636e; }
+    .edge { stroke: #8c959f; }
+    .grid { stroke: #c8ced5; }
+    .accent { stroke: #0969da; }
+    .accent-fill { fill: #0969da; fill-opacity: 0.12; }
+    .arrow { fill: #8c959f; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .ink { fill: #e6edf3; }
+      .quiet { fill: #9198a1; }
+      .edge { stroke: #6e7681; }
+      .grid { stroke: #3d444d; }
+      .accent { stroke: #4493f8; }
+      .accent-fill { fill: #4493f8; fill-opacity: 0.16; }
+      .arrow { fill: #6e7681; }
+    }
+  </style>
+  <defs>
+    <marker id="lab-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" class="arrow"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="760" height="496"/>
+  <text x="24" y="34" font-size="15" font-weight="600" class="ink">Only model calls leave the sandbox, and only through the gateway</text>
+
+  <!-- laptop -->
+  <rect x="24" y="52" width="496" height="420" rx="8" fill="none" class="edge" stroke-width="1"/>
+  <text x="40" y="78" font-weight="600" class="ink">Windows 11 laptop · Hyper-V</text>
+
+  <!-- sandbox -->
+  <rect x="56" y="96" width="300" height="104" rx="8" fill="none" class="edge" stroke-width="1.25"/>
+  <text x="72" y="120" font-weight="600" class="ink">Sandbox VM · 10.77.0.10</text>
+  <text x="72" y="136" font-size="11.5" class="ink">Claude Code in auto mode</text>
+  <text x="72" y="152" font-size="11.5" class="ink">Target and rootless Docker</text>
+  <text x="72" y="168" font-size="11.5" class="ink">Placeholder token only</text>
+  <text x="72" y="184" font-size="11.5" class="ink">No route out, no DNS</text>
+
+  <!-- gateway -->
+  <rect x="56" y="264" width="300" height="104" rx="8" class="accent-fill"/>
+  <rect x="56" y="264" width="300" height="104" rx="8" fill="none" class="accent" stroke-width="2"/>
+  <text x="72" y="288" font-weight="600" class="ink">Gateway VM · 10.77.0.1</text>
+  <text x="72" y="304" font-size="11.5" class="ink">nginx credential proxy on :8080</text>
+  <text x="72" y="320" font-size="11.5" class="ink">Holds the real token</text>
+  <text x="72" y="336" font-size="11.5" class="ink">nftables drops and logs the rest</text>
+  <text x="72" y="352" font-size="11.5" class="ink">Keeps all logs and transcripts</text>
+
+  <!-- wsl -->
+  <rect x="56" y="400" width="300" height="56" rx="8" fill="none" class="grid" stroke-width="1.25" stroke-dasharray="4 4"/>
+  <text x="72" y="424" font-weight="600" class="quiet">WSL2 and Docker Desktop</text>
+  <text x="72" y="440" font-size="11.5" class="quiet">Your normal work, not connected to the lab</text>
+
+  <!-- api -->
+  <rect x="560" y="284" width="176" height="64" rx="8" fill="none" class="edge" stroke-width="1.25"/>
+  <text x="576" y="308" font-weight="600" class="ink">api.anthropic.com</text>
+  <text x="576" y="324" font-size="11.5" class="ink">Defense Access account</text>
+
+  <!-- connectors -->
+  <g fill="none" class="edge" stroke-width="1.25">
+    <path d="M120 200V264" marker-end="url(#lab-arrow)"/>
+    <path d="M292 264V200" marker-end="url(#lab-arrow)"/>
+    <path d="M356 316H560" marker-end="url(#lab-arrow)"/>
+  </g>
+  <text x="132" y="236" font-size="11.5" class="quiet">Model calls only, :8080</text>
+  <text x="304" y="236" font-size="11.5" class="quiet">SSH: runs in, files out</text>
+  <text x="458" y="306" text-anchor="middle" font-size="11.5" class="quiet">HTTPS, token added</text>
+</svg>

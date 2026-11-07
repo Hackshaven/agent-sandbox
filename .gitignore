@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Never commit tokens, run evidence or transcripts.
+*token*.conf
+runs/
+*.jsonl

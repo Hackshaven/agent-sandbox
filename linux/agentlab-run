@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# agentlab-run: launch one contained run from the gateway.
+#
+#   agentlab-run --task TASK.md [--target DIR] [--turns 60] [--time 2h]
+#                [--model claude-opus-5-5] [--interactive] [--run-id ID]
+#
+# Usually started for you by:  .\agentlab.ps1 run -Task ... (on Windows),
+# which reverts the sandbox first. Every run gets its own folder in
+# /var/log/agentlab/runs/<id> with the task, transcript, new log lines and scan.
+set -euo pipefail
+
+SBX=10.77.0.10
+GW_IP=10.77.0.1
+LOG_DIR=/var/log/agentlab
+KEY="$HOME/.ssh/agentlab_ed25519"
+KNOWN="$HOME/.ssh/agentlab_known_hosts"
+SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5
+          -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+          -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN"
+          -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes)
+
+TASK="" TARGET="" TURNS=60 TIME=2h MODEL=claude-opus-5-5 INTERACTIVE=0 RUN_ID="" WAIT=180
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --task) TASK="$2"; shift 2 ;;
+    --target) TARGET="$2"; shift 2 ;;
+    --turns) TURNS="$2"; shift 2 ;;
+    --time) TIME="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --interactive) INTERACTIVE=1; shift ;;
+    --run-id) RUN_ID="$2"; shift 2 ;;
+    --wait) WAIT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+say()  { printf '==> %s\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+die()  { printf 'REFUSED: %s\n' "$*" >&2; exit 1; }
+sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@"; }
+
+# ------------------------------------------------------------ validate limits
+# Refuse to launch on any limit that can't be read, rather than running uncapped.
+[[ -n "$TASK" && -f "$TASK" ]] || die "--task file not found: ${TASK:-<none>}"
+[[ "$TURNS" =~ ^[0-9]+$ ]] && (( TURNS >= 1 && TURNS <= 500 )) || die "--turns must be 1-500"
+[[ "$TIME" =~ ^[0-9]+[smh]?$ ]] || die "--time must look like 30m, 2h or 5400s"
+[[ "$MODEL" =~ ^claude-[a-z0-9.-]+$ ]] || die "--model must be a full model ID such as claude-opus-5-5"
+[[ "$WAIT" =~ ^[0-9]+$ ]] || die "--wait must be seconds"
+[[ -z "$TARGET" || -d "$TARGET" ]] || die "--target folder not found: $TARGET"
+grep -q '^## Scope' "$TASK" || die "Task file has no '## Scope' section. Start from templates/task-template.md."
+[[ -z "$RUN_ID" ]] && RUN_ID="$(date +%Y%m%d-%H%M%S)"
+[[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "--run-id has unsafe characters"
+[[ -f "$KEY" ]] || die "No run key at $KEY. Run gateway-setup.sh first."
+
+# ------------------------------------------------------------ gateway preflight
+say "Gateway preflight"
+systemctl is-active -q nftables || die "nftables is not active"
+systemctl is-active -q nginx || die "nginx (credential proxy) is not active"
+[[ "$(cat /proc/sys/net/ipv4/ip_forward)" == 0 ]] || die "IP forwarding is on"
+ss -Hltn "sport = :8080" | awk '{print $4}' | grep -qx "$GW_IP:8080" || die "proxy not listening on $GW_IP:8080"
+if ss -Hltn "sport = :8080" | awk '{print $4}' | grep -qvx "$GW_IP:8080"; then
+  die "something else listens on port 8080 besides $GW_IP"
+fi
+[[ -w "$LOG_DIR/runs" ]] || die "can't write $LOG_DIR/runs"
+note "firewall, proxy and logs look right"
+
+# ------------------------------------------------------------ wait for sandbox
+say "Waiting for the sandbox at $SBX (up to ${WAIT}s)"
+deadline=$((SECONDS + WAIT))
+until sbx true 2>/dev/null; do
+  (( SECONDS < deadline )) || die "sandbox not reachable over SSH. Is it started and cut over?"
+  sleep 3
+done
+
+say "Sandbox preflight"
+# Runs as agent on the sandbox. Prints one line per failure.
+problems="$(sbx 'bash -s' <<'REMOTE'
+set -u
+ip route show default | grep -q . && echo "sandbox has a default route"
+ip -6 addr show scope global | grep -q inet6 && echo "sandbox has a global IPv6 address"
+getent hosts api.anthropic.com >/dev/null 2>&1 && echo "sandbox can resolve DNS"
+set -a; . /etc/environment; set +a
+[ "${ANTHROPIC_BASE_URL:-}" = "http://10.77.0.1:8080" ] || echo "ANTHROPIC_BASE_URL is not the proxy"
+case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in placeholder-*) ;; *) echo "CLAUDE_CODE_OAUTH_TOKEN is not the placeholder";; esac
+[ -n "${ANTHROPIC_API_KEY:-}" ] && echo "ANTHROPIC_API_KEY is set"
+[ -e "$HOME/.claude/.credentials.json" ] && echo "a stored Claude login exists in the sandbox"
+f=/etc/claude-code/managed-settings.json
+[ -f "$f" ] || echo "managed settings missing"
+[ -w "$f" ] && echo "agent can write managed settings"
+[ -w /etc/environment ] && echo "agent can write /etc/environment"
+grep -q '"auto"' "$f" 2>/dev/null || echo "managed settings don't set auto mode"
+grep -q 'No network' "$f" 2>/dev/null || echo "managed settings lack the No-network rule (run sandbox-setup.sh finalize)"
+command -v claude >/dev/null || echo "claude not on PATH"
+id -nG | grep -qwE 'sudo|docker|adm|lxd' && echo "agent is in a privileged group"
+mkdir -p /work/inbox /work/target 2>/dev/null || echo "can't create /work folders"
+exit 0
+REMOTE
+)" || die "sandbox preflight could not run"
+if [[ -n "$problems" ]]; then
+  printf '%s\n' "$problems" | sed 's/^/    FAIL  /'
+  die "sandbox preflight failed"
+fi
+note "sandbox looks contained"
+
+# ------------------------------------------------------------ run folder
+RUN_DIR="$LOG_DIR/runs/$RUN_ID"
+[[ ! -e "$RUN_DIR" ]] || die "run folder already exists: $RUN_DIR"
+mkdir -m 750 "$RUN_DIR"
+cp "$TASK" "$RUN_DIR/task.md"
+off_proxy=$(stat -c %s "$LOG_DIR/credproxy.log" 2>/dev/null || echo 0)
+off_deny=$(stat -c %s "$LOG_DIR/egress-deny.log" 2>/dev/null || echo 0)
+{
+  echo "run_id=$RUN_ID"
+  echo "started=$(date -Is)"
+  echo "operator=$(id -un)"
+  echo "mode=$([[ $INTERACTIVE == 1 ]] && echo interactive || echo headless)"
+  echo "model=$MODEL"
+  echo "max_turns=$TURNS"
+  echo "time_limit=$TIME"
+  echo "task_sha256=$(sha256sum "$TASK" | cut -d' ' -f1)"
+  echo "target=${TARGET:-none}"
+} > "$RUN_DIR/meta.txt"
+
+# ------------------------------------------------------------ deliver inputs
+say "Delivering inputs"
+sbx 'rm -rf /work/target /work/inbox && mkdir -p /work/target /work/inbox && cat > /work/inbox/task.md' < "$TASK"
+if [[ -n "$TARGET" ]]; then
+  tar -C "$TARGET" -cf - . | sbx 'tar -C /work/target -xf -'
+  echo "target_sha256=$(tar -C "$TARGET" --sort=name --mtime=@0 --owner=0 --group=0 -cf - . | sha256sum | cut -d' ' -f1)" >> "$RUN_DIR/meta.txt"
+fi
+
+stop_remote() {
+  sbx 'pkill -TERM -u agent -f "claude( |$)" ; sleep 2; pkill -KILL -u agent -f "claude( |$)"; exit 0' 2>/dev/null || true
+}
+collect() {
+  set +e
+  say "Collecting evidence into $RUN_DIR"
+  sbx 'cd "$HOME" && [ -d .claude ] && tar -czf - .claude/projects 2>/dev/null' > "$RUN_DIR/claude-projects.tgz" 2>/dev/null
+  [[ -s "$RUN_DIR/claude-projects.tgz" ]] || rm -f "$RUN_DIR/claude-projects.tgz"
+  for pair in "credproxy:$off_proxy" "egress-deny:$off_deny"; do
+    name="${pair%%:*}" off="${pair##*:}" f="$LOG_DIR/${pair%%:*}.log"
+    [[ -r "$f" ]] || continue
+    size=$(stat -c %s "$f")
+    if (( size < off )); then cp "$f" "$RUN_DIR/$name.new.log"      # rotated during the run
+    else tail -c +"$((off + 1))" "$f" > "$RUN_DIR/$name.new.log"; fi
+  done
+  echo "ended=$(date -Is)" >> "$RUN_DIR/meta.txt"
+}
+trap 'echo; note "Interrupted: stopping the agent"; stop_remote; collect; exit 130' INT TERM
+
+# ------------------------------------------------------------ launch
+REMOTE_ENV='set -a; . /etc/environment; set +a; cd /work/target'
+rc=0
+if [[ $INTERACTIVE == 1 ]]; then
+  say "Interactive session (time limit $TIME). You approve or supervise every step."
+  note "Recording to $RUN_DIR/session.log"
+  script -q -f -e "$RUN_DIR/session.log" -c \
+    "ssh ${SSH_OPTS[*]} -t agent@$SBX '$REMOTE_ENV; exec timeout --foreground --kill-after=30s $TIME claude --model $MODEL --permission-mode auto'" || rc=$?
+else
+  say "Headless run: $TURNS turns max, $TIME max, model $MODEL"
+  note "Transcript: $RUN_DIR/transcript.jsonl"
+  set +e
+  sbx "$REMOTE_ENV; exec timeout --kill-after=30s $TIME claude -p --model $MODEL --max-turns $TURNS --permission-mode auto --output-format stream-json --verbose < /work/inbox/task.md" \
+    | agentlab-monitor --out "$RUN_DIR/transcript.jsonl" --require-init
+  codes=("${PIPESTATUS[@]}")
+  set -e
+  remote_rc=${codes[0]} monitor_rc=${codes[1]}
+  echo "remote_exit=$remote_rc" >> "$RUN_DIR/meta.txt"
+  echo "monitor_exit=$monitor_rc" >> "$RUN_DIR/meta.txt"
+  [[ $remote_rc == 124 || $remote_rc == 137 ]] && note "Time limit reached; the run is final and won't be resumed."
+  case $monitor_rc in
+    3) note "Stopped: not running in auto mode." ;;
+    4) note "Stopped: denial budget spent." ;;
+    5) note "Stopped: no init message (did claude start?)." ;;
+  esac
+  rc=$(( monitor_rc != 0 ? monitor_rc : remote_rc ))
+fi
+trap - INT TERM
+stop_remote
+collect
+
+# ------------------------------------------------------------ review
+say "Review"
+deny_lines=$(grep -c . "$RUN_DIR/egress-deny.new.log" 2>/dev/null || true)
+proxy_refused=$(awk '$5 != 200' "$RUN_DIR/credproxy.new.log" 2>/dev/null | grep -c . || true)
+proxy_ok=$(awk '$5 == 200' "$RUN_DIR/credproxy.new.log" 2>/dev/null | grep -c . || true)
+note "model calls forwarded: ${proxy_ok:-0}    proxy refusals: ${proxy_refused:-0}    firewall denies: ${deny_lines:-0}"
+if [[ "${proxy_refused:-0}" != 0 ]]; then
+  note "Proxy refusals (method path status):"
+  awk '$5 != 200 {print "      " $3, $4, $5}' "$RUN_DIR/credproxy.new.log" | sort | uniq -c | head -20
+fi
+if [[ "${deny_lines:-0}" != 0 ]]; then
+  note "Firewall denies (first 20). Read this run's transcript first:"
+  head -20 "$RUN_DIR/egress-deny.new.log" | sed 's/^/      /'
+fi
+if [[ -s "$RUN_DIR/transcript.jsonl" ]]; then
+  agentlab-scan "$RUN_DIR/transcript.jsonl" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
+  head -40 "$RUN_DIR/scan.txt" | sed 's/^/    /'
+  (( scan_rc == 2 )) && note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt"
+fi
+note "Evidence: $RUN_DIR"
+exit "$rc"
