@@ -5,5 +5,7 @@ templates/** text eol=lf
 *.sh         text eol=lf
 *.py         text eol=lf
 *.md         text
+# Review agents must match the agency-agents catalog byte for byte.
+.claude/agents/** text eol=lf
 *.svg        text
 *.ps1        text

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run every check that doesn't need the real VMs:
-#   lint (bash -n, shellcheck), transcript tools, credential proxy, firewall.
+#   lint (bash -n, shellcheck), transcript tools, run launcher checks,
+#   credential proxy, firewall.
 # The firewall namespace tests need root; run with sudo to include them.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -22,6 +23,7 @@ rm -rf linux/__pycache__
 echo "transcript tools"
 python3 -m unittest -q tests/test_transcripts.py || status=1
 
+bash tests/test_run.sh || status=1
 bash tests/test_proxy.sh || status=1
 bash tests/test_firewall.sh || status=1
 

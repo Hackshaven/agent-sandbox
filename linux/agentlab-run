@@ -38,13 +38,25 @@ done
 say()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf 'REFUSED: %s\n' "$*" >&2; exit 1; }
-sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@"; }
+# The sandbox writes what comes back on stderr, so show it through cat -v. Every
+# command runs through the agent's own shell, which the agent can stall, so each
+# call has a time bound: sbx SECONDS COMMAND...
+# --foreground keeps ssh in the terminal's process group, as it was before the bound.
+sbx()  { local t="$1"; shift; timeout --foreground -k 5 "$t" ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@" 2> >(cat -v >&2); }
 
 # ------------------------------------------------------------ validate limits
 # Refuse to launch on any limit that can't be read, rather than running uncapped.
 [[ -n "$TASK" && -f "$TASK" ]] || die "--task file not found: ${TASK:-<none>}"
 [[ "$TURNS" =~ ^[0-9]+$ ]] && (( TURNS >= 1 && TURNS <= 500 )) || die "--turns must be 1-500"
-[[ "$TIME" =~ ^[0-9]+[smh]?$ ]] || die "--time must look like 30m, 2h or 5400s"
+# A zero duration means "no limit" to timeout(1), so the first digit can't be 0,
+# and a run on an everyday laptop is capped at a day.
+[[ "$TIME" =~ ^[1-9][0-9]{0,5}[smh]?$ ]] || die "--time must be a positive duration such as 30m, 2h or 5400s"
+case "$TIME" in
+  *h) time_s=$(( ${TIME%h} * 3600 )) ;;
+  *m) time_s=$(( ${TIME%m} * 60 )) ;;
+  *)  time_s=${TIME%s} ;;
+esac
+(( time_s <= 86400 )) || die "--time must be at most 24h"
 [[ "$MODEL" =~ ^claude-[a-z0-9.-]+$ ]] || die "--model must be a full model ID such as claude-opus-5-5"
 [[ "$WAIT" =~ ^[0-9]+$ ]] || die "--wait must be seconds"
 [[ -z "$TARGET" || -d "$TARGET" ]] || die "--target folder not found: $TARGET"
@@ -68,17 +80,23 @@ note "firewall, proxy and logs look right"
 # ------------------------------------------------------------ wait for sandbox
 say "Waiting for the sandbox at $SBX (up to ${WAIT}s)"
 deadline=$((SECONDS + WAIT))
-until sbx true 2>/dev/null; do
+until sbx 15 true < /dev/null > /dev/null 2>&1; do
   (( SECONDS < deadline )) || die "sandbox not reachable over SSH. Is it started and cut over?"
   sleep 3
 done
 
 say "Sandbox preflight"
 # Runs as agent on the sandbox. Prints one line per failure.
-problems="$(sbx 'bash -s' <<'REMOTE'
+problems="$(sbx 60 'bash -s' <<'REMOTE'
 set -u
-ip route show default | grep -q . && echo "sandbox has a default route"
-ip -6 addr show scope global | grep -q inet6 && echo "sandbox has a global IPv6 address"
+# As strict as agentlab-check: the lab route present (so an empty read fails), no
+# route beyond the lab in any routing table, no IPv6 address at all, one network
+# interface, and the lab address.
+ip -4 route show | grep -q '^10\.77\.0\.0/24 dev ' || echo "sandbox has no route to 10.77.0.0/24 (or its routes can't be read)"
+ip -4 route show table all | grep -vE '^(local|broadcast) |^10\.77\.0\.0/24 dev ' | grep -q . && echo "sandbox has a route beyond 10.77.0.0/24"
+ip -6 addr show 2>/dev/null | grep -q inet6 && echo "sandbox has an IPv6 address"
+[ "$(ip -o link show | awk -F': ' '$2 != "lo"' | grep -c .)" = 1 ] || echo "sandbox doesn't have exactly one network interface"
+ip -4 -o addr show | grep -q ' 10\.77\.0\.10/24 ' || echo "sandbox address isn't 10.77.0.10/24"
 getent hosts api.anthropic.com >/dev/null 2>&1 && echo "sandbox can resolve DNS"
 set -a; . /etc/environment; set +a
 [ "${ANTHROPIC_BASE_URL:-}" = "http://10.77.0.1:8080" ] || echo "ANTHROPIC_BASE_URL is not the proxy"
@@ -92,13 +110,14 @@ f=/etc/claude-code/managed-settings.json
 grep -q '"auto"' "$f" 2>/dev/null || echo "managed settings don't set auto mode"
 grep -q 'No network' "$f" 2>/dev/null || echo "managed settings lack the No-network rule (run sandbox-setup.sh finalize)"
 command -v claude >/dev/null || echo "claude not on PATH"
-id -nG | grep -qwE 'sudo|docker|adm|lxd' && echo "agent is in a privileged group"
+id -nG | grep -qwE 'sudo|docker|adm|lxd|admin|wheel|disk|root|libvirt|incus-admin' && echo "agent is in a privileged group"
+sudo -n true 2>/dev/null && echo "agent can sudo without a password"
 mkdir -p /work/inbox /work/target 2>/dev/null || echo "can't create /work folders"
 exit 0
 REMOTE
 )" || die "sandbox preflight could not run"
 if [[ -n "$problems" ]]; then
-  printf '%s\n' "$problems" | sed 's/^/    FAIL  /'
+  printf '%s\n' "$problems" | cat -v | sed 's/^/    FAIL  /'   # cat -v: the text came from the sandbox
   die "sandbox preflight failed"
 fi
 note "sandbox looks contained"
@@ -124,19 +143,22 @@ off_deny=$(stat -c %s "$LOG_DIR/egress-deny.log" 2>/dev/null || echo 0)
 
 # ------------------------------------------------------------ deliver inputs
 say "Delivering inputs"
-sbx 'rm -rf /work/target /work/inbox && mkdir -p /work/target /work/inbox && cat > /work/inbox/task.md' < "$TASK"
+sbx 120 'rm -f "$HOME/.agentlab-session.pid"; rm -rf /work/target /work/inbox && mkdir -p /work/target /work/inbox && cat > /work/inbox/task.md' < "$TASK" > /dev/null
 if [[ -n "$TARGET" ]]; then
-  tar -C "$TARGET" -cf - . | sbx 'tar -C /work/target -xf -'
+  tar -C "$TARGET" -cf - . | sbx 1800 'tar -C /work/target -xf -' > /dev/null
   echo "target_sha256=$(tar -C "$TARGET" --sort=name --mtime=@0 --owner=0 --group=0 -cf - . | sha256sum | cut -d' ' -f1)" >> "$RUN_DIR/meta.txt"
 fi
 
 stop_remote() {
-  sbx 'pkill -TERM -u agent -f "claude( |$)" ; sleep 2; pkill -KILL -u agent -f "claude( |$)"; exit 0' 2>/dev/null || true
+  sbx 20 'pkill -TERM -u agent -f "claude( |$)" ; sleep 2; pkill -KILL -u agent -f "claude( |$)"; exit 0' \
+    < /dev/null > /dev/null 2>&1 || true
 }
 collect() {
   set +e
   say "Collecting evidence into $RUN_DIR"
-  sbx 'cd "$HOME" && [ -d .claude ] && tar -czf - .claude/projects 2>/dev/null' > "$RUN_DIR/claude-projects.tgz" 2>/dev/null
+  sbx 600 'cd "$HOME" && [ -d .claude ] && tar -czf - .claude/projects 2>/dev/null' < /dev/null 2>/dev/null \
+    | head -c 2147483648 > "$RUN_DIR/claude-projects.tgz"   # 2 GiB: the agent decides what's in it
+  echo "projects_tgz_exit=${PIPESTATUS[0]} bytes=$(stat -c %s "$RUN_DIR/claude-projects.tgz")" >> "$RUN_DIR/meta.txt"
   [[ -s "$RUN_DIR/claude-projects.tgz" ]] || rm -f "$RUN_DIR/claude-projects.tgz"
   for pair in "credproxy:$off_proxy" "egress-deny:$off_deny"; do
     name="${pair%%:*}" off="${pair##*:}" f="$LOG_DIR/${pair%%:*}.log"
@@ -147,7 +169,298 @@ collect() {
   done
   echo "ended=$(date -Is)" >> "$RUN_DIR/meta.txt"
 }
-trap 'echo; note "Interrupted: stopping the agent"; stop_remote; collect; exit 130' INT TERM
+# Interactive runs: a watcher follows the transcripts Claude Code writes on the
+# sandbox, through agentlab-monitor, and ends the session if it leaves auto mode,
+# spends the denial budget, writes a line the monitor won't trust, or goes quiet.
+# The session writes its own PID to ~/.agentlab-session.pid (cleared at delivery).
+# The sandbox side is one Python process, sent on ssh's stdin. It follows every
+# transcript written since it started (/clear starts a new one) and never drops
+# one while its file lives, so a file the agent adds can add lines but can't hide
+# any. It is the feed's only writer and sends each record whole, so records from
+# two transcripts can't mix. It works in passes: look for new transcripts, read at
+# most 1 MiB of each, check each is still the file it opened, then send a
+# heartbeat, so a heartbeat means a whole pass finished and a growing decoy can't
+# hold it on one file. It makes itself undumpable, so the agent can't open its
+# output through /proc to forge one. It exits, and so ends the gateway's view: 2
+# if the session never wrote its PID, 5 if ~/.claude, its projects folder or a
+# project folder is a symbolic link or can't be read, if a followed file is
+# deleted, replaced, truncated or holds a heartbeat line, or if a new one isn't a
+# regular file or can't be opened, 6 if no transcript appears within five minutes,
+# 7 past 256 transcripts, 0 once the session has ended and every finished record
+# is sent. A record still unfinished then (a time-limit kill mid-write) isn't sent;
+# its file and size go to watch.log, and the copy in claude-projects.tgz is scanned.
+# Everything on that side runs as agent, so the gateway treats any early end of
+# the watcher, or WATCH_STALL seconds with nothing from it, as a lost watcher and
+# ends the session itself: a tripwire that fails closed, not a control the agent
+# can't touch.
+read -r -d '' WATCH_REMOTE <<'WATCH' || true
+import ctypes
+import os
+import stat
+import sys
+import time
+
+HEARTBEAT = b'{"agentlab": "heartbeat"}\n'   # agentlab-monitor --session skips exactly this
+MAX_LINE = 16 * 1024 * 1024                  # agentlab-monitor stops on a longer line
+MAX_FILES = 256
+PASS_BYTES = 1024 * 1024                     # read from each transcript per pass
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+PIDFILE = os.path.join(HOME, ".agentlab-session.pid")
+T0 = int(time.time())
+followed = {}   # path -> [fd, (dev, inode), bytes read, the line still being written]
+
+
+def send(data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(1, view):]
+
+
+def say(text):   # to watch.log; paths go through ascii(), so no name can add a line
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    os.write(2, ("%s %s\n" % (stamp, text)).encode("ascii", "backslashreplace"))
+
+
+def leave(code, why):
+    say("watcher: " + why)
+    sys.exit(code)
+
+
+def running(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, OverflowError):
+        return False
+
+
+def real_dir(path):
+    """True if path is a directory, False if it doesn't exist; leaves on a link."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        leave(5, "%s can't be read: %s" % (ascii(path), e.strerror))
+    if not stat.S_ISDIR(st.st_mode):
+        leave(5, "%s isn't a folder (a symbolic link?)" % ascii(path))
+    return True
+
+
+def listing(path):
+    """The entries of a folder this watcher must be able to read, or none if it's gone."""
+    try:
+        return list(os.scandir(path))
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        leave(5, "%s can't be read: %s" % (ascii(path), e.strerror))
+
+
+def discover():
+    """Follow each .jsonl file in ~/.claude/projects/<dir>/ written since T0. Anything
+    that could keep a new transcript out of sight (a link, a folder or file this
+    watcher can't read) ends the watch instead."""
+    if not real_dir(os.path.dirname(PROJECTS)) or not real_dir(PROJECTS):
+        return
+    for d in listing(PROJECTS):
+        if d.is_symlink():
+            leave(5, "%s is a symbolic link" % ascii(d.path))
+        if not d.is_dir(follow_symlinks=False):
+            continue
+        for e in listing(d.path):
+            if not e.name.endswith(".jsonl") or e.path in followed:
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if st.st_mtime <= T0:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                leave(5, "%s isn't a regular file" % ascii(e.path))
+            if len(followed) >= MAX_FILES:
+                leave(7, "more than %d transcripts" % MAX_FILES)
+            try:
+                fd = os.open(e.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                leave(5, "%s can't be opened: %s" % (ascii(e.path), err.strerror))
+            fst = os.fstat(fd)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                leave(5, "%s was replaced as it was opened" % ascii(e.path))
+            followed[e.path] = [fd, (st.st_dev, st.st_ino), 0, bytearray()]
+            say("following %s" % ascii(e.path))
+
+
+def forward(path, block):
+    """Send finished lines, unless one is a heartbeat, which only this watcher sends."""
+    if (b"\n" + block).find(b"\n" + HEARTBEAT) >= 0:
+        leave(5, "%s holds a heartbeat line" % ascii(path))
+    send(block)
+
+
+def read_new(path, entry, limit=PASS_BYTES):
+    """Send each line finished since the last read, whole, reading at most limit
+    bytes. Returns True if there may be more to read."""
+    fd, _, _, line = entry
+    left = limit
+    while left > 0:
+        chunk = os.read(fd, min(left, 1 << 20))
+        if not chunk:
+            return False
+        left -= len(chunk)
+        entry[2] += len(chunk)
+        line += chunk
+        end = line.rfind(b"\n") + 1
+        if end:
+            forward(path, bytes(line[:end]))
+            del line[:end]
+        if len(line) > MAX_LINE:   # the monitor stops on a line this long, so pass it on
+            send(line)
+            del line[:]
+    return True
+
+
+def check(path, entry):
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        leave(5, "%s was deleted" % ascii(path))
+    if (st.st_dev, st.st_ino) != entry[1]:
+        leave(5, "%s was replaced" % ascii(path))
+    if os.fstat(entry[0]).st_size < entry[2]:
+        leave(5, "%s was truncated" % ascii(path))
+
+
+def undumpable():
+    """So the agent, same user, can't open this process's output through /proc."""
+    try:
+        if ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) != 0:   # PR_SET_DUMPABLE
+            say("watcher: couldn't make itself undumpable")
+    except (OSError, AttributeError):
+        say("watcher: couldn't make itself undumpable")
+
+
+def one_pass(checking=True):
+    """Read every transcript once, up to PASS_BYTES each; True if any has more."""
+    more = False
+    for path, entry in list(followed.items()):
+        more = read_new(path, entry) or more   # what the file holds, then whether
+        if checking:                           # it's still the same file
+            check(path, entry)
+    return more
+
+
+def main():
+    undumpable()
+    send(HEARTBEAT)
+    pid = None
+    for _ in range(60):
+        try:
+            with open(PIDFILE, "rb") as f:
+                text = f.read(64).strip()
+        except OSError:
+            text = b""
+        if text:
+            if not text.isdigit():
+                leave(2, "the session's PID file holds no PID")
+            pid = int(text)
+            break
+        time.sleep(1)
+        send(HEARTBEAT)
+    if pid is None:
+        leave(2, "the session never wrote its PID")
+    started = time.monotonic()
+    while running(pid):
+        discover()
+        more = one_pass()
+        if not followed and time.monotonic() - started > 300:
+            leave(6, "no transcript appeared within five minutes")
+        send(HEARTBEAT)   # a whole pass, checks included, has finished
+        if not more:
+            time.sleep(1)
+    while one_pass(checking=False):   # the session has ended: send what's left,
+        send(HEARTBEAT)               # then look once more for a late transcript
+    discover()
+    while one_pass(checking=False):
+        send(HEARTBEAT)
+    for path, entry in followed.items():
+        if entry[3]:
+            say("%s ends partway through a record (%d bytes), not sent" % (ascii(path), len(entry[3])))
+    say("the session has ended")
+
+
+try:
+    main()
+except BrokenPipeError:   # the gateway stopped reading
+    sys.exit(1)
+WATCH
+SESSION_FLAG="$RUN_DIR/.session-running"
+WATCH_FEED="$RUN_DIR/.watch-feed.pid"
+WATCH_STALL=30   # seconds with nothing from the watcher (it beats every second) before it's lost
+WATCH_GRACE=10   # seconds the watcher gets to finish once the session has ended
+watch_pid=""
+end_session() {   # end_session REASON: stop the interactive session from the gateway side
+  echo "watch_stop=$1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  stop_remote & local sr=$!
+  for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || break; sleep 1; done
+  # stop_remote runs through the agent's own shell, so don't wait on it: end the
+  # local ssh -t too. The run then finishes, and agentlab.ps1 reverts the VM.
+  [[ -e "$SESSION_FLAG" ]] && { pkill -TERM -u "$(id -u)" -f -- \
+    "-t agent@${SBX//./\\.} .*\\.agentlab-session\\.pid" 2>/dev/null || true; }
+  wait "$sr" 2>/dev/null || true
+}
+kill_feed() {   # end the watcher's ssh (its timeout passes the signal on), if it's still up
+  if [[ -s "$WATCH_FEED" ]] && kill "$(cat "$WATCH_FEED")" 2>/dev/null; then
+    echo "watch_feed_killed=1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  fi
+  return 0
+}
+watch_session() {   # runs in the background for the length of an interactive session
+  set +e
+  local mrc
+  # A process substitution, so the monitor's exit acts at once rather than when
+  # ssh next writes. The feed records its timeout's PID, which $! can't give
+  # here; the timeout is the gateway's own deadline on it, past the session's.
+  agentlab-monitor --session --quiet --stall "$WATCH_STALL" --log "$RUN_DIR/session-monitor.log" \
+    --out "$RUN_DIR/session-transcript.jsonl" 2>>"$RUN_DIR/session-monitor.log" \
+    < <(timeout -k 5 "$((time_s + 180))" ssh "${SSH_OPTS[@]}" "agent@$SBX" 'exec python3 -I -' \
+          <<<"$WATCH_REMOTE" 2> >(head -c 1048576 >> "$RUN_DIR/watch.log") &
+        echo "$!" > "$WATCH_FEED"; wait "$!"; feed_rc=$?; : > "$WATCH_FEED"   # gone: forget its PID
+        echo "watch_remote_exit=$feed_rc at=$(date -Is)" >> "$RUN_DIR/meta.txt")
+  mrc=$?
+  echo "watch_exit=$mrc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  kill_feed   # nothing reads it now
+  case $mrc in
+    3|4|7|8) [[ -e "$SESSION_FLAG" ]] && end_session "the monitor stopped it (exit $mrc)" ;;
+    *) # The watcher stopped reading. If the session is still up, nothing is watching it.
+       for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || break; sleep 1; done
+       [[ -e "$SESSION_FLAG" ]] && end_session "the watcher ended (exit $mrc) while the session ran" ;;
+  esac
+  return 0
+}
+stop_watch() {   # let the watcher finish once the session has ended, then make sure it has
+  [[ -n "$watch_pid" ]] || return 0
+  for _ in $(seq 1 "$WATCH_GRACE"); do kill -0 "$watch_pid" 2>/dev/null || break; sleep 1; done
+  if ! grep -q '^watch_exit=' "$RUN_DIR/meta.txt" 2>/dev/null; then   # still reading
+    echo "watch_unfinished=1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+    kill_feed   # its end of file lets the monitor, and watch_session, finish
+    for _ in 1 2 3 4 5; do kill -0 "$watch_pid" 2>/dev/null || break; sleep 1; done
+  fi
+  pkill -TERM -P "$watch_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
+  kill_feed; rm -f "$WATCH_FEED"
+}
+on_signal() {   # on_signal NAME CODE: stop the agent and keep the evidence
+  [[ $1 == HUP ]] && exec > /dev/null 2>&1   # the operator's terminal is gone
+  echo; note "Interrupted ($1): stopping the agent"
+  echo "interrupted=$1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  rm -f "$SESSION_FLAG"; stop_remote; stop_watch; collect; exit "$2"
+}
+trap 'on_signal INT 130' INT; trap 'on_signal TERM 143' TERM; trap 'on_signal HUP 129' HUP
 
 # ------------------------------------------------------------ launch
 REMOTE_ENV='set -a; . /etc/environment; set +a; cd /work/target'
@@ -155,13 +468,21 @@ rc=0
 if [[ $INTERACTIVE == 1 ]]; then
   say "Interactive session (time limit $TIME). You approve or supervise every step."
   note "Recording to $RUN_DIR/session.log"
+  note "agentlab-monitor follows the session transcript and ends the session if it"
+  note "leaves auto mode, spends the denial budget, or stops being watched."
+  : > "$SESSION_FLAG"
+  watch_session & watch_pid=$!
   script -q -f -e "$RUN_DIR/session.log" -c \
-    "ssh ${SSH_OPTS[*]} -t agent@$SBX '$REMOTE_ENV; exec timeout --foreground --kill-after=30s $TIME claude --model $MODEL --permission-mode auto'" || rc=$?
+    "timeout --foreground -k 30 $((time_s + 120)) ssh ${SSH_OPTS[*]} -t agent@$SBX '$REMOTE_ENV; echo \$\$ >\"\$HOME/.agentlab-session.pid\"; exec timeout --foreground --kill-after=30s $TIME claude --model $MODEL --permission-mode auto'" || rc=$?
+  rm -f "$SESSION_FLAG"
+  echo "session_exit=$rc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  [[ $rc == 124 || $rc == 137 ]] && note "Time limit reached; the run is final and won't be resumed."
 else
   say "Headless run: $TURNS turns max, $TIME max, model $MODEL"
   note "Transcript: $RUN_DIR/transcript.jsonl"
   set +e
-  sbx "$REMOTE_ENV; exec timeout --kill-after=30s $TIME claude -p --model $MODEL --max-turns $TURNS --permission-mode auto --output-format stream-json --verbose < /work/inbox/task.md" \
+  # The remote timeout runs as the agent; sbx's bound is the gateway's own.
+  sbx "$((time_s + 120))" "$REMOTE_ENV; exec timeout --kill-after=30s $TIME claude -p --model $MODEL --max-turns $TURNS --permission-mode auto --output-format stream-json --verbose < /work/inbox/task.md" < /dev/null \
     | agentlab-monitor --out "$RUN_DIR/transcript.jsonl" --require-init
   codes=("${PIPESTATUS[@]}")
   set -e
@@ -173,11 +494,42 @@ else
     3) note "Stopped: not running in auto mode." ;;
     4) note "Stopped: denial budget spent." ;;
     5) note "Stopped: no init message (did claude start?)." ;;
+    6) note "Stopped: the init message didn't say which permission mode it ran in." ;;
+    7) note "Stopped: the transcript passed the monitor's size limits." ;;
   esac
   rc=$(( monitor_rc != 0 ? monitor_rc : remote_rc ))
 fi
-trap - INT TERM
+trap - INT TERM HUP
 stop_remote
+if [[ -n "$watch_pid" ]]; then
+  stop_watch
+  watch_rc="$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
+  watch_stop="$(sed -n 's/^watch_stop=\(.*\) at=.*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
+  watch_unfinished="$(grep -c '^watch_unfinished=' "$RUN_DIR/meta.txt" || true)"
+  watch_remote="$(sed -n 's/^watch_remote_exit=\([0-9]*\).*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
+  case "$watch_remote" in   # the watcher's own refusals, which can come after the session
+    2|5|6|7) note "The watcher on the sandbox exited $watch_remote, so treat the session as unwatched; watch.log says why." ;;
+    *) watch_remote="" ;;
+  esac
+  [[ -n "$watch_stop" ]] && note "The watcher ended the session: $watch_stop."
+  [[ "$watch_unfinished" != 0 ]] && note "The watcher hadn't finished ${WATCH_GRACE}s after the session ended, so its last records were checked only by the scan below."
+  case "$watch_rc" in
+    0) ;;
+    3) note "Stopped: a prompt was sent outside auto mode." ;;
+    4) note "Stopped: denial budget spent." ;;
+    6) note "The session transcript never confirmed auto mode." ;;
+    7) note "Stopped: the session transcript had a line the monitor won't trust." ;;
+    8) note "Stopped: nothing came from the watcher for ${WATCH_STALL}s, so nothing was watching." ;;
+    "") note "The watcher left no result, so treat the session as unwatched." ;;
+    *) note "The watcher ended with exit $watch_rc, so treat the session as unwatched." ;;
+  esac
+  [[ -s "$RUN_DIR/session-monitor.log" ]] && note "The watcher's view: $RUN_DIR/session-monitor.log"
+  case "$watch_rc" in
+    3|4|7|8) rc="$watch_rc" ;;
+    *) if [[ -n "$watch_stop" || -n "$watch_remote" || "$watch_unfinished" != 0 ]]; then rc=8   # lost
+       elif [[ "$watch_rc" != 0 ]]; then rc="${watch_rc:-1}"; fi ;;
+  esac
+fi
 collect
 
 # ------------------------------------------------------------ review
@@ -194,10 +546,19 @@ if [[ "${deny_lines:-0}" != 0 ]]; then
   note "Firewall denies (first 20). Read this run's transcript first:"
   head -20 "$RUN_DIR/egress-deny.new.log" | sed 's/^/      /'
 fi
-if [[ -s "$RUN_DIR/transcript.jsonl" ]]; then
-  agentlab-scan "$RUN_DIR/transcript.jsonl" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
+transcripts=()   # what the gateway saw, then everything the sandbox kept
+for t in transcript.jsonl session-transcript.jsonl claude-projects.tgz; do
+  [[ -s "$RUN_DIR/$t" ]] && transcripts+=("$RUN_DIR/$t")
+done
+if (( ${#transcripts[@]} )); then
+  timeout -k 10 600 agentlab-scan "${transcripts[@]}" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
   head -40 "$RUN_DIR/scan.txt" | sed 's/^/    /'
-  (( scan_rc == 2 )) && note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt"
+  case $scan_rc in
+    0) ;;
+    2) note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt" ;;
+    3) note "The scan stopped partway through an archive; read the transcripts it lists by hand. Full list: $RUN_DIR/scan.txt" ;;
+    *) note "The scan didn't finish (exit $scan_rc), so read the transcripts by hand." ;;
+  esac
 fi
 note "Evidence: $RUN_DIR"
 exit "$rc"

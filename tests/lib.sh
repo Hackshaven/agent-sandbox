@@ -21,9 +21,10 @@ finish() {
   (( T_FAIL == 0 ))
 }
 
-# Print the body of the heredoc that starts on the line containing $1 in file $2.
+# Print the body of the heredoc that starts on the line containing $1 in file $2
+# and ends at a line that is exactly $3 (default EOF).
 heredoc_body() {
-  awk -v start="$1" 'index($0, start) { f = 1; next } f && /^EOF$/ { exit } f' "$2"
+  awk -v start="$1" -v end="${3:-EOF}" 'index($0, start) { f = 1; next } f && $0 == end { exit } f' "$2"
 }
 
 # Render an unquoted heredoc from gateway-setup.sh with the given variable assignments.

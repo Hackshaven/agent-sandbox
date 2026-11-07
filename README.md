@@ -27,8 +27,9 @@ Pro, Enterprise or Education.
 | `linux/agentlab-monitor.py` | Gateway | Live view; stops runs not in auto mode or over the denial budget |
 | `linux/agentlab-scan.py` | Gateway | Pattern rules over transcripts |
 | `templates/` | — | Task template and the escape test |
-| `tests/` | Linux or CI | Firewall, proxy and transcript-tool tests (see Testing) |
+| `tests/` | Linux or CI | Firewall, proxy, launcher and transcript-tool tests (see Testing) |
 | `docs/` | — | Design rationale, layout diagram, sources |
+| `.claude/agents/` | Claude Code sessions | Review agents from the agency-agents catalog, routed in `CLAUDE.md` |
 
 Read the scripts before you run them. They are short, and they draw the boundary.
 
@@ -107,6 +108,8 @@ Watch it. Stop with Ctrl+C at the first odd move (`.\agentlab.ps1 stop` is the
 hard off-switch). Afterward, read the whole transcript in
 `/var/log/agentlab/runs/<id>/` and note, for each attempt, whether the sandbox or
 auto mode stopped it. Any success is a blocker: fix it and retest before real runs.
+Run it a second time with `-Interactive`, which exercises the session watcher
+(attempt 7 in the template is aimed at it).
 
 ## Run a job
 
@@ -118,34 +121,129 @@ That one command reverts the sandbox, delivers the task and target, runs Claude
 Code headless with your limits, collects the evidence, scans the transcript,
 prints any new proxy refusals and firewall denies, and reverts again.
 
-Add `-Interactive` for a supervised session instead (recorded on the gateway).
+Add `-Interactive` for a supervised session instead. It's recorded on the gateway,
+and `agentlab-monitor` follows its transcript and ends the session if a prompt is
+sent outside auto mode (switching to plan or accept-edits mode ends it too), the
+denial budget runs out, the transcript holds a line the monitor won't trust, or
+the watcher ends, or sends no heartbeat (it sends one about every second) for 30
+seconds, while the session runs. It follows the new transcript `/clear` starts,
+and ends the session if a transcript or its folder is made unreadable or a link.
+The watcher runs as the agent on the sandbox, so treat it as a tripwire, not a
+guard: keep watching the session.
 
-Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`,
-`claude-projects.tgz`, `credproxy.new.log`, `egress-deny.new.log` and `scan.txt`.
-Folders older than 45 days are pruned.
+Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
+(headless) or `session.log`, `session-transcript.jsonl`, `session-monitor.log` and
+`watch.log` (interactive), `claude-projects.tgz`, `credproxy.new.log`,
+`egress-deny.new.log` and `scan.txt`. `meta.txt` records how the run ended; its
+lines can land out of order, so go by their `at=` times. A headless run records
+`remote_exit` and `monitor_exit`. An interactive one records:
+
+- `session_exit`, and `watch_exit`, the monitor's exit code
+- `watch_stop` if the gateway ended the session, and why
+- `watch_remote_exit`, the watcher's own exit code: 2, 5, 6 or 7 as the comment
+  above `WATCH_REMOTE` in `agentlab-run` lists them, 255 if its connection dropped
+  or was cut, or 124 or 137 at the gateway's deadline. `watch.log` says why, with
+  times
+- `watch_feed_killed` if the gateway cut the watcher's connection
+- `watch_unfinished` if the watcher was given 10 seconds, once the agent was
+  stopped, and hadn't finished
+
+Any run can record `interrupted` after Ctrl+C, a closed window or a TERM, and
+`projects_tgz_exit` for the evidence pull.
+
+The run's exit code says how it ended: 0 finished, 3 not in auto mode, 4 denial
+budget spent, 5 no init message, 6 auto mode not confirmed, 7 a transcript line
+the monitor won't trust, 8 the watcher ended, went quiet or hadn't finished,
+124 or 137 the time limit, 129, 130 or 143 interrupted. In an interactive run, a
+code from the watcher takes the place of the session's own, 124 and 137
+included.
+
+Folders older than 45 days are pruned. The files are kept byte for byte,
+including whatever the agent wrote (the gateway's copy of a session transcript
+leaves out the watcher's heartbeats), so read them with `less` (not `less -R`)
+or `cat -v`, never plain `cat` or `tail -f`, and don't paste into an admin
+console after reading `session.log`.
 
 ## When something changes
 
-- **New tools or a new Claude Code version:** `.\agentlab.ps1 reopen`, then
-  `sudo ~/agentlab/linux/sandbox-setup.sh reopen` at the sandbox console, rerun
-  `install`, then steps 6 to 8. That is a sandbox change, so the escape test runs
-  again. `agentlab-run` refuses to start while the sandbox has a route out.
+- **New tools, a new Claude Code version, or a change to `sandbox-setup.sh` or
+  `agentlab-check.sh`.** `agentlab.ps1 run` restores the old baseline until step 7
+  saves a new one, so finish all of this before the next real run:
+  1. `.\agentlab.ps1 reopen` (type REOPEN), then at the sandbox console
+     `sudo ~/agentlab/linux/sandbox-setup.sh reopen`.
+  2. Only if you're copying anything from Windows (a changed `linux/`, tools,
+     target source): cutover allows SSH only for `agent` from the gateway, so at
+     the console run
+     `sudo sed -i '/^AllowUsers/d' /etc/ssh/sshd_config.d/00-agentlab.conf && sudo systemctl restart ssh`
+     (if you log in with a password, delete its `PasswordAuthentication no` line
+     too; cutover writes the file again). Then from Windows:
+     ```powershell
+     ssh you@agentlab-sbx.mshome.net rm -rf agentlab/linux
+     scp -r ..\linux "you@agentlab-sbx.mshome.net:agentlab/"
+     ssh you@agentlab-sbx.mshome.net chmod +x agentlab/linux/*
+     ```
+  3. Rerun `install` with the options you used in step 5, plus any new
+     `--packages` or `--images`. The gateway's key is already on the sandbox:
+     `--gateway-key "$(sudo cut -d' ' -f2- /home/agent/.ssh/authorized_keys)"`.
+  4. Steps 6 to 8. That is a sandbox change, so the escape test runs again. After
+     a new Claude Code version, also check one interactive run against "Known
+     limits".
+- **A change to `gateway-setup.sh` (the firewall, the proxy, logging) or to
+  `agentlab-run`, `agentlab-monitor.py`, `agentlab-scan.py` or `agentlab-check.sh`.**
+  `gateway-setup.sh` installs copies, so nothing changes until it runs again. Copy
+  the kit to the gateway, rerun it (press Enter to keep the stored token, and pass
+  `--inside-if` again if the first run needed it), and check. It prints the run
+  key again; the sandbox already has it.
+  ```powershell
+  ssh you@agentlab-gw.mshome.net rm -rf agentlab/linux
+  scp -r ..\linux "you@agentlab-gw.mshome.net:agentlab/"
+  ssh you@agentlab-gw.mshome.net chmod +x agentlab/linux/*
+  ```
+  Then on the gateway: `sudo ~/agentlab/linux/gateway-setup.sh` and
+  `sudo agentlab-check gateway`. A firewall or proxy change moves the boundary
+  itself, so also check from the sandbox side and rerun the escape test before the
+  next real run: `.\agentlab.ps1 revert -Start`, then at the sandbox console
+  `sudo agentlab-check sandbox --model-call`, then `.\agentlab.ps1 revert` and
+  step 8. A change to `agentlab-check.sh` also needs the sandbox steps above,
+  since the sandbox has its own copy.
 - **New model:** rerun the escape test with `-Model <id>`.
-- **Proxy refusals:** `sudo agentlab-check gateway` lists refused paths. Add one to
-  `/etc/nginx/sites-available/agentlab` only if it is a model call, then
-  `sudo nginx -t && sudo systemctl reload nginx`.
+- **Proxy refusals:** `sudo agentlab-check gateway` lists refused paths. Allow one
+  only if it is a model call: add an exact `location =` line beside the others in
+  the proxy section of `linux/gateway-setup.sh`, update `docs/design.md` in the
+  same commit, and deploy it as above. An edit to
+  `/etc/nginx/sites-available/agentlab` alone skips review, and the next run of
+  `gateway-setup.sh` erases it. `agentlab-check gateway` reads the whole day's log,
+  so it lists the old 403s until the log rotates; the next run's review shows
+  only that run's.
 - **A hit during a run:** stop it, keep the run folder, report out-of-scope
   behavior through support.claude.com as a Cyber Verification Program participant,
-  and rotate the token (`claude setup-token`, then rerun `gateway-setup.sh`).
+  and rotate the token (`claude setup-token`, then rerun `gateway-setup.sh` and
+  paste the new one).
+  - Stopping: in a headless run, Ctrl+C stops the agent and collects the evidence.
+    In an interactive run Ctrl+C goes to Claude Code, so use `/exit`.
+    `.\agentlab.ps1 stop` powers the VM off at once, so there's no
+    `claude-projects.tgz`, and `run` reverts the VM either way. To keep the VM's
+    state, start the run with `-KeepRunning` and checkpoint it before you revert:
+    `Checkpoint-VM -Name agentlab-sbx -SnapshotName evidence-<id>`.
+  - Keeping: copy the run folder somewhere the 45-day prune won't reach.
+  - Reading: `transcript.jsonl` and `session-transcript.jsonl` were copied to the
+    gateway as the run went and end where the run was stopped;
+    `claude-projects.tgz` is everything the sandbox held at the end, which the
+    agent could have edited; `meta.txt` says how the run ended. If it has no
+    `ended=` line, collection didn't finish, so cut the run's lines from
+    `/var/log/agentlab/credproxy.log` and `egress-deny.log` by time.
 
 ## Testing
 
 `tests/run-all.sh` runs everything that doesn't need the real VMs: lint, the
-transcript tools, and the credential proxy against a mock upstream. Run it with
-`sudo` to add the firewall tests, which build a two-namespace copy of the lab and
-check what the sandbox can and can't reach (with controls that prove the firewall,
-not the setup, is what blocks). CI runs all of it on every push, plus a parse and
-PSScriptAnalyzer pass on `agentlab.ps1`.
+transcript tools, the launcher's limit checks, and the credential proxy against a
+mock upstream. Run it with `sudo` to add the firewall tests, which build a copy of
+the lab in three network namespaces (sandbox, gateway, and a stand-in for the
+internet) and check what gets through over TCP, UDP and, where the kernel has it,
+IPv6, including with forwarding turned on. Every refusal has a control: the same
+path, shown open before the rules load, so a pass means the firewall stopped it.
+CI runs all of it on every push, plus a parse, a check of `-Time` and `-Model`
+under both PowerShell versions, and a PSScriptAnalyzer pass on `agentlab.ps1`.
 
 These tests cover the scripts' logic, not your machine. The isolation checks in
 steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
@@ -154,9 +252,27 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
 
 - `agentlab.ps1` is parsed and linted in CI but hasn't run against Hyper-V yet.
   Run `.\agentlab.ps1 status` first; if a cmdlet errors, the fix is usually one parameter.
-- The auto mode denial text in `agentlab-monitor` and `agentlab-scan` is a best
-  guess. Check it against the first real denial in a transcript and adjust
-  `--deny-pattern` if it doesn't match.
+- How Claude Code marks an auto mode denial isn't documented. `agentlab-monitor`
+  and `agentlab-scan` count one from the record's `toolDenialKind` and
+  `permissionDecision` fields, which Claude Code 2.1.319 writes in session
+  transcripts, and otherwise from its text, which that version words "denied by
+  the Claude Code auto mode classifier". Whether a headless stream carries the
+  fields is unverified. Check the first real denial of each kind of run, and
+  adjust `--deny-pattern` if it doesn't match.
+- The monitor reads the permission mode from `permissionMode` in a headless run's
+  init message and on each prompt in an interactive run's session transcript, as
+  one Claude Code version writes them. If yours doesn't, a headless run stops at
+  init (exit 6) and an interactive one ends flagged as unconfirmed. Check the
+  first run of each kind.
+- The interactive watcher assumes, from Claude Code 2.1.319, that a session's
+  transcript is a `.jsonl` file directly under `~/.claude/projects/<dir>/`, that
+  `/clear` starts a new one, and that subagents write separate files below it.
+  If yours differs, the watcher finds no transcript and ends the session five
+  minutes after it starts, or follows the wrong file. Check one interactive
+  run after each Claude Code update. A session with no first prompt within five
+  minutes is ended the same way, since its transcript doesn't exist yet.
+- The monitor stops a run on a transcript line over 16 MiB. A tool result that
+  carries a very large file (an image or PDF read whole) could reach that.
 - Unverified until your first run: that auto mode works with a custom
   `ANTHROPIC_BASE_URL` on your plan, which extra paths Claude Code requests, and
   that `/etc/claude-code/managed-settings.json` is read (the sandbox check tests

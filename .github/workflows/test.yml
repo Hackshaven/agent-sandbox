@@ -21,6 +21,8 @@ jobs:
         run: bash tests/run-all.sh
       - name: Firewall reachability (network namespaces, needs root)
         run: sudo bash tests/test_firewall.sh
+      - name: Launch preflight route checks (network namespace, needs root)
+        run: sudo bash tests/test_run.sh
 
   windows:
     runs-on: windows-latest
@@ -34,6 +36,12 @@ jobs:
             "$PWD/windows/agentlab.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors | ForEach-Object { Write-Error "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
           Write-Host 'agentlab.ps1 parses cleanly'
+      - name: Limit validation (PowerShell 7)
+        shell: pwsh
+        run: ./tests/test_ps1_limits.ps1
+      - name: Limit validation (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/test_ps1_limits.ps1
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
