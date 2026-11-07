@@ -51,7 +51,7 @@ proxy log line.
 | Dedicate the host; assume an agent could read anything on it | An everyday laptop, with Hyper-V the only layer between the sandbox and everything else | Keep runs short and watched. For long unattended batches, move this design to a spare Linux machine with KVM |
 | Run the escape test on a host you can rebuild | The VM reverts; the laptop doesn't | Watch the test live and stop at the first odd move |
 | Sandbox escape classifier score | Not available to agents in Claude Code | Transcript and log review |
-| Proxy forwards model calls only | The path allowlist is a starting guess | Tune it from 403 lines after the first real run |
+| Proxy forwards model calls only | The path allowlist is a starting guess | Tune it from 403 lines after the first real run, in `gateway-setup.sh` so the change is reviewed and survives a rerun |
 | Treat auto mode rules as security config | Root-owned managed settings; the agent isn't root | Recheck `claude auto-mode config` after every Claude Code update |
 | Orchestrator on the trusted side | An interactive run puts the agent's terminal on yours, escape sequences included; nothing filters a live session | Prefer headless runs for anything long or unwatched |
 | Stop runs that leave auto mode | An interactive session's mode is read from each prompt in its transcript, so a mode change mid-turn shows at the next prompt | The operator is watching an interactive run by definition; the scan flags any prompt outside auto mode afterward |

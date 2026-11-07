@@ -245,7 +245,8 @@ server {
 
     location = /v1/messages              { limit_except POST { deny all; } include /etc/nginx/agentlab-upstream.conf; }
     location = /v1/messages/count_tokens { limit_except POST { deny all; } include /etc/nginx/agentlab-upstream.conf; }
-    # Add more exact paths here only if they are model calls (see credproxy.log 403s).
+    # Add exact paths in gateway-setup.sh, not here: rerunning it rewrites this file.
+    # Only model calls, and only when a credproxy.log 403 shows Claude Code needs one.
 
     location / { return 403; }
 }

@@ -85,7 +85,7 @@ check_gateway() {
     local refused
     refused="$(awk '$5 != 200 {print $3, $4, $5}' "$LOG_DIR/credproxy.log" | sort | uniq -c | sort -rn | head -10)"
     if [[ -n "$refused" ]]; then
-      warn "proxy has refused these (method path status). Allow a path only if it's a model call:"
+      warn "proxy has refused these (method path status). Allow a path only if it's a model call, in gateway-setup.sh:"
       sed 's/^/          /' <<<"$refused"
     fi
   fi

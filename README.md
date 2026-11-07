@@ -130,14 +130,32 @@ Folders older than 45 days are pruned.
 
 ## When something changes
 
-- **New tools or a new Claude Code version:** `.\agentlab.ps1 reopen`, then
-  `sudo ~/agentlab/linux/sandbox-setup.sh reopen` at the sandbox console, rerun
+- **New tools, a new Claude Code version, or a change to the sandbox scripts:**
+  `.\agentlab.ps1 reopen`, then `sudo ~/agentlab/linux/sandbox-setup.sh reopen` at
+  the sandbox console. If `linux/` changed, copy it over before `install`. Cutover
+  allows SSH only for `agent` from the gateway, so at the console run
+  `sudo rm /etc/ssh/sshd_config.d/00-agentlab.conf && sudo systemctl restart ssh`
+  and repeat step 3 for `agentlab-sbx` (cutover writes the file again). Then rerun
   `install`, then steps 6 to 8. That is a sandbox change, so the escape test runs
   again. `agentlab-run` refuses to start while the sandbox has a route out.
+- **A change to the gateway scripts** (the firewall, the proxy, or any `agentlab-*`
+  command): `gateway-setup.sh` installs copies, so nothing changes until it runs
+  again. Copy the kit to the gateway, rerun it (press Enter to keep the stored
+  token), and check:
+  ```powershell
+  ssh you@agentlab-gw.mshome.net rm -rf agentlab/linux
+  scp -r ..\linux "you@agentlab-gw.mshome.net:agentlab/"
+  ssh you@agentlab-gw.mshome.net chmod +x agentlab/linux/*
+  ```
+  Then on the gateway: `sudo ~/agentlab/linux/gateway-setup.sh` and
+  `sudo agentlab-check gateway`.
 - **New model:** rerun the escape test with `-Model <id>`.
-- **Proxy refusals:** `sudo agentlab-check gateway` lists refused paths. Add one to
-  `/etc/nginx/sites-available/agentlab` only if it is a model call, then
-  `sudo nginx -t && sudo systemctl reload nginx`.
+- **Proxy refusals:** `sudo agentlab-check gateway` lists refused paths. Allow one
+  only if it is a model call: add an exact `location =` line beside the others in
+  the proxy section of `linux/gateway-setup.sh`, update `docs/design.md` in the
+  same commit, and deploy it as above. An edit to
+  `/etc/nginx/sites-available/agentlab` alone skips review, and the next run of
+  `gateway-setup.sh` erases it.
 - **A hit during a run:** stop it, keep the run folder, report out-of-scope
   behavior through support.claude.com as a Cyber Verification Program participant,
   and rotate the token (`claude setup-token`, then rerun `gateway-setup.sh`).
