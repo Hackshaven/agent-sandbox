@@ -38,6 +38,14 @@ done
 check "a task file without '## Scope' is refused" refused_for "no '## Scope' section" --task "$TMP/noscope.md"
 check "a missing task file is refused" refused_for "--task file not found" --task "$TMP/missing.md"
 
+# Whatever the sandbox writes on stderr reaches the operator's terminal through
+# sbx, so sbx must show it through cat -v.
+SBX_FN="$(grep -E '^sbx\(\) ' "$RUN")"
+# shellcheck disable=SC2034  # SSH_OPTS and SBX are read by the eval'd sbx
+stderr_seen="$(ssh() { printf '\033]0;owned\007boom\n' >&2; }; SSH_OPTS=(); SBX=x; eval "$SBX_FN"; sbx true 2>&1)"
+check "sbx shows the sandbox's stderr with control characters visible" \
+  bash -c '[[ "$1" != *$'"'"'\e'"'"'* && "$1" == *"^["*boom* ]]' _ "$stderr_seen"
+
 # The sandbox preflight, as shipped: the heredoc agentlab-run sends over SSH.
 PREFLIGHT="$(heredoc_body "<<'REMOTE'" "$RUN" REMOTE)"
 NET_CHECKS="$(grep -E '^ip -[46] ' <<<"$PREFLIGHT")"

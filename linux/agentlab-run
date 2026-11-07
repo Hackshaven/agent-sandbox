@@ -38,7 +38,8 @@ done
 say()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf 'REFUSED: %s\n' "$*" >&2; exit 1; }
-sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@"; }
+# The sandbox writes what comes back on stderr, so show it through cat -v.
+sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@" 2> >(cat -v >&2); }
 
 # ------------------------------------------------------------ validate limits
 # Refuse to launch on any limit that can't be read, rather than running uncapped.
@@ -296,8 +297,8 @@ if [[ "${deny_lines:-0}" != 0 ]]; then
   note "Firewall denies (first 20). Read this run's transcript first:"
   head -20 "$RUN_DIR/egress-deny.new.log" | sed 's/^/      /'
 fi
-transcripts=()
-for t in transcript.jsonl session-transcript.jsonl; do
+transcripts=()   # what the gateway saw, then everything the sandbox kept
+for t in transcript.jsonl session-transcript.jsonl claude-projects.tgz; do
   [[ -s "$RUN_DIR/$t" ]] && transcripts+=("$RUN_DIR/$t")
 done
 if (( ${#transcripts[@]} )); then
