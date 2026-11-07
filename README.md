@@ -179,9 +179,13 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
 
 - `agentlab.ps1` is parsed and linted in CI but hasn't run against Hyper-V yet.
   Run `.\agentlab.ps1 status` first; if a cmdlet errors, the fix is usually one parameter.
-- The auto mode denial text in `agentlab-monitor` and `agentlab-scan` is a best
-  guess. Check it against the first real denial in a transcript and adjust
-  `--deny-pattern` if it doesn't match.
+- How Claude Code marks an auto mode denial isn't documented. `agentlab-monitor`
+  and `agentlab-scan` count one from the record's `toolDenialKind` and
+  `permissionDecision` fields, which Claude Code 2.1.319 writes in session
+  transcripts, and otherwise from its text, which that version words "denied by
+  the Claude Code auto mode classifier". Whether a headless stream carries the
+  fields is unverified. Check the first real denial of each kind of run, and
+  adjust `--deny-pattern` if it doesn't match.
 - The monitor reads the permission mode from `permissionMode` in a headless run's
   init message and on each prompt in an interactive run's session transcript, as
   one Claude Code version writes them. If yours doesn't, a headless run stops at

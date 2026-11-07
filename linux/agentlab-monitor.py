@@ -16,11 +16,18 @@ ends the session when the monitor stops.
 
 Exit codes: 0 finished, 3 not in auto mode, 4 denial budget spent,
 5 no init message seen, 6 auto mode not confirmed (an init message with no
-permissionMode, or with --session, no prompt that records one).
+permissionMode, or with --session, no prompt that records one), 7 input it
+won't trust (a record over --max-line-bytes, more than --max-total-bytes in
+all, or with --session, a line that isn't a transcript record).
 
-Neither the denial text nor these permissionMode fields are documented here.
-The patterns and fields are what one Claude Code version writes. Check them
-against the first real transcript and adjust --deny-pattern if needed.
+The monitor reads input the agent can shape, and with --session a file the
+agent can write, so a record it can't parse never ends its loop: the raw bytes
+still go to --out, and the line is reported, or with --session, stops the run.
+
+A denial is counted from the record's own fields when it has them (session
+transcripts mark one with toolDenialKind and permissionDecision), and otherwise
+from its text. Neither is documented; both are what Claude Code 2.1.319 wrote.
+Check them against the first real transcript and adjust --deny-pattern if needed.
 """
 import argparse
 import json
@@ -30,7 +37,7 @@ import sys
 DEFAULT_DENY = (r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|"
                 r"auto[- ]mode (has )?(denied|blocked)|"
                 r"permission to use \S+ (has been|was) denied|"
-                r"denied by (the )?(auto[- ]mode|permission) classifier)")
+                r"denied by (the )?(claude code )?(auto[- ]mode|permission) classifier)")
 DEFAULT_UNAVAILABLE = r"(?i)temporarily unavailable, so auto mode cannot determine"
 
 
@@ -75,16 +82,26 @@ def short(s, n):
 
 def describe_tool(block):
     name = block.get("name", "?")
-    inp = block.get("input") or {}
-    for key in ("command", "file_path", "path", "pattern", "url", "query"):
-        if key in inp:
-            return f"{name}: {short(inp[key], 140)}"
+    inp = block.get("input")
+    if isinstance(inp, dict):
+        for key in ("command", "file_path", "path", "pattern", "url", "query"):
+            if key in inp:
+                return f"{name}: {short(inp[key], 140)}"
     return f"{name}: {short(json.dumps(inp), 140)}"
+
+
+def classifier_denied(msg):
+    """True when a record marks an auto mode classifier denial in its own fields."""
+    if msg.get("toolDenialKind") == "automode-blocked":
+        return True
+    decision = msg.get("permissionDecision")
+    return (isinstance(decision, dict) and decision.get("decision") == "reject"
+            and decision.get("reasonType") == "classifier")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", required=True, help="file to write the raw stream to")
+    ap.add_argument("--out", required=True, help="file to append the raw input to, byte for byte")
     ap.add_argument("--max-consecutive-denials", type=int, default=3)
     ap.add_argument("--max-denials", type=int, default=20)
     ap.add_argument("--deny-pattern", default=DEFAULT_DENY)
@@ -94,106 +111,160 @@ def main():
     ap.add_argument("--session", action="store_true",
                     help="input is a Claude Code session transcript (an interactive run): "
                          "fail (exit 6) at the end if no prompt confirmed auto mode")
+    ap.add_argument("--max-line-bytes", type=int, default=16 * 1024 * 1024)
+    ap.add_argument("--max-total-bytes", type=int, default=1024 * 1024 * 1024)
+    ap.add_argument("--log", help="write the view to this file instead of the terminal")
     ap.add_argument("--quiet", action="store_true", help="no terminal view")
     args = ap.parse_args()
 
     deny_re = re.compile(args.deny_pattern)
     unavail_re = re.compile(args.unavailable_pattern)
-    denials = consecutive = unavailable = tool_calls = 0
-    saw_init = confirmed = False
-    turn = 0
+    state = {"denials": 0, "consecutive": 0, "unavailable": 0, "tool_calls": 0,
+             "turn": 0, "saw_init": False, "confirmed": False}
+    log = open(args.log, "a", encoding="utf-8") if args.log else None
 
     def show(msg):
-        if not args.quiet:
-            print(printable(msg), flush=True)
+        text = printable(msg)
+        if log:
+            log.write(text + "\n")
+            log.flush()
+        elif not args.quiet:
+            print(text, flush=True)
 
-    with open(args.out, "a", encoding="utf-8") as out:
-        for raw in sys.stdin:
+    def handle(msg):
+        """Act on one record. Returns an exit code to stop with, or None."""
+        mtype = msg.get("type")
+
+        if mtype == "system" and msg.get("subtype") == "init":
+            if args.session:
+                show("  ! STOP: an init record in a session transcript, which Claude Code doesn't write there")
+                return 7
+            state["saw_init"] = True
+            mode = msg.get("permissionMode")
+            show(f"[init] model={msg.get('model', '?')} permissionMode={mode or '?'} "
+                 f"cwd={msg.get('cwd', '?')}")
+            if mode is None:
+                show("  ! STOP: init message has no permissionMode field, so auto mode can't be confirmed")
+                return 6
+            if mode != "auto":
+                show(f"  ! STOP: permission mode is '{mode}', not 'auto'")
+                return 3
+            state["confirmed"] = True
+            return None
+
+        # Prompts in a session transcript record the mode they were sent in.
+        if mtype == "user" and "permissionMode" in msg:
+            mode = msg.get("permissionMode")
+            if mode != "auto":
+                show(f"  ! STOP: a prompt was sent in permission mode '{mode}', not 'auto'")
+                return 3
+            state["confirmed"] = True
+
+        body = msg.get("message")
+        content = body.get("content") if isinstance(body, dict) else None
+        if not isinstance(content, list):
+            content = []
+
+        if mtype == "assistant":
+            state["turn"] += 1
+            turn = state["turn"]
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    state["tool_calls"] += 1
+                    show(f"[{turn:>3}] {describe_tool(block)}")
+                elif block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        show(f"[{turn:>3}] says: {short(text, 160)}")
+
+        elif mtype == "user":
+            blocked = msg.get("toolDenialKind") == "automode-blocked"
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                text = text_of(block.get("content"))
+                is_error = bool(block.get("is_error"))
+                if is_error and blocked:
+                    denied = True
+                elif unavail_re.search(text):
+                    state["unavailable"] += 1
+                    show(f"      ~ classifier unavailable ({state['unavailable']})")
+                    continue
+                else:
+                    denied = is_error and (classifier_denied(msg) or bool(deny_re.search(text)))
+                if denied:
+                    state["denials"] += 1
+                    state["consecutive"] += 1
+                    show(f"      ! DENIED ({state['consecutive']} in a row, {state['denials']} total): "
+                         f"{short(text, 140)}")
+                    if (state["consecutive"] >= args.max_consecutive_denials
+                            or state["denials"] >= args.max_denials):
+                        show(f"  ! STOP: denial budget spent ({state['consecutive']} in a row, "
+                             f"{state['denials']} total). Read the transcript, then start a fresh run. "
+                             "Don't resume this one.")
+                        return 4
+                else:
+                    state["consecutive"] = 0
+                    if is_error:
+                        show(f"      x error: {short(text, 140)}")
+
+        elif mtype == "result":
+            show(f"[done] {msg.get('subtype', '?')} after {msg.get('num_turns', '?')} turns, "
+                 f"{state['tool_calls']} tool calls, {state['denials']} denials, "
+                 f"{state['unavailable']} unavailable")
+        return None
+
+    total = 0
+    lineno = 0
+    with open(args.out, "ab") as out:
+        stdin = sys.stdin.buffer
+        while True:
+            raw = stdin.readline(args.max_line_bytes + 1)
+            if not raw:
+                break
             out.write(raw)
             out.flush()
-            line = raw.strip()
+            lineno += 1
+            total += len(raw)
+            if total > args.max_total_bytes:
+                show(f"  ! STOP: input passed {args.max_total_bytes} bytes")
+                return 7
+            if len(raw) > args.max_line_bytes:
+                show(f"  ! STOP: line {lineno} is longer than {args.max_line_bytes} bytes")
+                return 7
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                msg = None
+            if not isinstance(msg, dict):
+                if args.session:
+                    show(f"  ! STOP: line {lineno} isn't a transcript record: {short(line, 120)}")
+                    return 7
                 show(f"  (non-JSON) {short(line, 160)}")
                 continue
-            if not isinstance(msg, dict):
+            try:
+                rc = handle(msg)
+            except Exception as e:  # a shape this monitor didn't expect must not end its loop
+                if args.session:
+                    show(f"  ! STOP: line {lineno} is a record this monitor can't read ({type(e).__name__})")
+                    return 7
+                show(f"  ! couldn't read line {lineno} ({type(e).__name__}); carrying on")
                 continue
-            mtype = msg.get("type")
+            if rc is not None:
+                return rc
 
-            if mtype == "system" and msg.get("subtype") == "init":
-                saw_init = True
-                mode = msg.get("permissionMode")
-                show(f"[init] model={msg.get('model', '?')} permissionMode={mode or '?'} "
-                     f"cwd={msg.get('cwd', '?')}")
-                if mode is None:
-                    show("  ! STOP: init message has no permissionMode field, so auto mode can't be confirmed")
-                    return 6
-                if mode != "auto":
-                    show(f"  ! STOP: permission mode is '{mode}', not 'auto'")
-                    return 3
-                confirmed = True
-                continue
-
-            # Prompts in a session transcript record the mode they were sent in.
-            if mtype == "user" and "permissionMode" in msg:
-                mode = msg.get("permissionMode")
-                if mode != "auto":
-                    show(f"  ! STOP: a prompt was sent in permission mode '{mode}', not 'auto'")
-                    return 3
-                confirmed = True
-
-            body = msg.get("message") or {}
-            content = body.get("content") if isinstance(body, dict) else None
-            if not isinstance(content, list):
-                content = []
-
-            if mtype == "assistant":
-                turn += 1
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "tool_use":
-                        tool_calls += 1
-                        show(f"[{turn:>3}] {describe_tool(block)}")
-                    elif block.get("type") == "text" and block.get("text", "").strip():
-                        show(f"[{turn:>3}] says: {short(block['text'], 160)}")
-
-            elif mtype == "user":
-                for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "tool_result":
-                        continue
-                    text = text_of(block.get("content"))
-                    if unavail_re.search(text):
-                        unavailable += 1
-                        show(f"      ~ classifier unavailable ({unavailable})")
-                    elif block.get("is_error") and deny_re.search(text):
-                        denials += 1
-                        consecutive += 1
-                        show(f"      ! DENIED ({consecutive} in a row, {denials} total): {short(text, 140)}")
-                        if consecutive >= args.max_consecutive_denials or denials >= args.max_denials:
-                            show(f"  ! STOP: denial budget spent ({consecutive} in a row, {denials} total). "
-                                 "Read the transcript, then start a fresh run. Don't resume this one.")
-                            return 4
-                    else:
-                        consecutive = 0
-                        if block.get("is_error"):
-                            show(f"      x error: {short(text, 140)}")
-
-            elif mtype == "result":
-                show(f"[done] {msg.get('subtype', '?')} after {msg.get('num_turns', '?')} turns, "
-                     f"{tool_calls} tool calls, {denials} denials, {unavailable} unavailable")
-
-    if args.require_init and not saw_init:
+    if args.require_init and not state["saw_init"]:
         show("  ! stream ended without an init message")
         return 5
-    if args.session and not confirmed:
+    if args.session and not state["confirmed"]:
         show("  ! no prompt in the session transcript confirmed auto mode")
         return 6
     return 0
-
 
 if __name__ == "__main__":
     try:

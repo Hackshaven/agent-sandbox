@@ -65,8 +65,11 @@ RULES = [
 ]
 COMPILED = [(n, kind, re.compile(rx)) for n, kind, rx in RULES]
 
+# Kept equal to agentlab-monitor's patterns. Session transcripts also mark a denial
+# in the record's own fields, which classifier_denied() reads first.
 DENY_RE = re.compile(r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|auto[- ]mode (has )?(denied|blocked)"
-                     r"|permission to use \S+ (has been|was) denied|denied by (the )?(auto[- ]mode|permission) classifier)")
+                     r"|permission to use \S+ (has been|was) denied"
+                     r"|denied by (the )?(claude code )?(auto[- ]mode|permission) classifier)")
 UNAVAIL_RE = re.compile(r"(?i)temporarily unavailable, so auto mode cannot determine")
 
 
@@ -128,6 +131,15 @@ def snippet(text, m, width=70):
     return ("…" if a else "") + s + ("…" if b < len(text) else "")
 
 
+def classifier_denied(msg):
+    """True when a record marks an auto mode classifier denial in its own fields."""
+    if msg.get("toolDenialKind") == "automode-blocked":
+        return True
+    decision = msg.get("permissionDecision")
+    return (isinstance(decision, dict) and decision.get("decision") == "reject"
+            and decision.get("reasonType") == "classifier")
+
+
 def mode_finding(msg):
     """(label, text) when a record shows the run outside auto mode, else None."""
     if msg.get("type") == "system" and msg.get("subtype") == "init":
@@ -141,43 +153,64 @@ def mode_finding(msg):
     return None
 
 
+def scan_record(msg, lineno, counts, hits):
+    finding = mode_finding(msg)
+    if finding:
+        hits.append((lineno, "not-auto-mode", finding[0], finding[1]))
+    body = msg.get("message")
+    content = body.get("content") if isinstance(body, dict) else None
+    if not isinstance(content, list):
+        return
+    blocked = msg.get("toolDenialKind") == "automode-blocked"
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            counts["calls"] += 1
+            for kind, text, label in fields(block):
+                for name, rkind, rx in COMPILED:
+                    if rkind != kind:
+                        continue
+                    m = rx.search(text)
+                    if m:
+                        hits.append((lineno, name, label, snippet(text, m)))
+        elif block.get("type") == "tool_result":
+            text = flatten(block.get("content"))
+            is_error = bool(block.get("is_error"))
+            if not (is_error and blocked) and UNAVAIL_RE.search(text):
+                counts["unavailable"] += 1
+            elif is_error and (blocked or classifier_denied(msg) or DENY_RE.search(text)):
+                counts["denials"] += 1
+                hits.append((lineno, "auto-mode-denial", "result", " ".join(text.split())[:160]))
+
+
+def scan_lines(lines):
+    """Scan an iterable of transcript lines (bytes or str)."""
+    hits, counts = [], {"calls": 0, "denials": 0, "unavailable": 0}
+    for lineno, raw in enumerate(lines, 1):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if not raw.strip():
+            continue
+        try:
+            msg = json.loads(raw)
+        except (ValueError, RecursionError):
+            msg = None
+        if not isinstance(msg, dict):
+            # A transcript is one JSON object per line. Anything else is a line
+            # these rules can't read, which is worth reading by hand.
+            hits.append((lineno, "unreadable-line", "line", " ".join(raw.split())[:160]))
+            continue
+        try:
+            scan_record(msg, lineno, counts, hits)
+        except Exception as e:  # a shape these rules didn't expect
+            hits.append((lineno, "unreadable-line", "record", type(e).__name__))
+    return hits, counts["denials"], counts["unavailable"], counts["calls"]
+
+
 def scan_file(path):
-    hits, denials, unavailable, calls = [], 0, 0, 0
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for lineno, raw in enumerate(f, 1):
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            finding = mode_finding(msg)
-            if finding:
-                hits.append((lineno, "not-auto-mode", finding[0], finding[1]))
-            body = msg.get("message")
-            content = body.get("content") if isinstance(body, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_use":
-                    calls += 1
-                    for kind, text, label in fields(block):
-                        for name, rkind, rx in COMPILED:
-                            if rkind != kind:
-                                continue
-                            m = rx.search(text)
-                            if m:
-                                hits.append((lineno, name, label, snippet(text, m)))
-                elif block.get("type") == "tool_result":
-                    text = flatten(block.get("content"))
-                    if UNAVAIL_RE.search(text):
-                        unavailable += 1
-                    elif block.get("is_error") and DENY_RE.search(text):
-                        denials += 1
-                        hits.append((lineno, "auto-mode-denial", "result", " ".join(text.split())[:160]))
-    return hits, denials, unavailable, calls
+    with open(path, "rb") as f:
+        return scan_lines(f)
 
 
 def expand(args):

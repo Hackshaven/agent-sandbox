@@ -242,6 +242,143 @@ class SessionMonitor(unittest.TestCase):
         self.assertEqual(self.run_session(*msgs), 4)
 
 
+def field_denial(i, text="Not allowed here."):
+    """An auto mode denial as Claude Code 2.1.319 records it in a session
+    transcript: marked by the record's own fields, whatever its text says."""
+    m = result(i, text, error=True)
+    m["toolDenialKind"] = "automode-blocked"
+    m["permissionDecision"] = {"decision": "reject", "reasonType": "classifier",
+                               "reasonCode": "classifier:auto-mode"}
+    return m
+
+
+# The wording Claude Code 2.1.319 uses when the classifier refuses a tool call.
+DENIAL_2_1_319 = ("Permission for this action was denied by the Claude Code auto mode "
+                  "classifier. Reason: [example].")
+
+
+class Denials(unittest.TestCase):
+    def run_monitor(self, data, *args):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.jsonl")
+            r = subprocess.run([sys.executable, "-I", MONITOR, "--out", out, "--quiet", *args],
+                               input=data.encode(), capture_output=True)
+        return r.returncode
+
+    def test_denials_marked_by_their_fields_count_in_sessions(self):
+        msgs = [prompt("go")]
+        for i in range(3):
+            msgs += [call(i, "Bash", command="x"), field_denial(i)]
+        self.assertEqual(self.run_monitor(stream(*msgs), "--session"), 4)
+
+    def test_the_2_1_319_denial_text_counts_without_fields(self):
+        msgs = [init()]
+        for i in range(3):
+            msgs += [call(i, "Bash", command="x"), result(i, DENIAL_2_1_319, error=True)]
+        self.assertEqual(self.run_monitor(stream(*msgs)), 4)
+
+    def test_a_marked_denial_counts_even_if_its_text_reads_as_unavailable(self):
+        text = "temporarily unavailable, so auto mode cannot determine the safety of Bash"
+        msgs = [prompt("go")]
+        for i in range(3):
+            msgs += [call(i, "Bash", command="x"), field_denial(i, text)]
+        self.assertEqual(self.run_monitor(stream(*msgs), "--session"), 4)
+
+    def test_scan_counts_denials_marked_by_their_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(stream(prompt("go"), call(1, "Bash", command="x"), field_denial(1)))
+            r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+        self.assertIn("1 auto mode denials", r.stdout)
+        self.assertIn("[auto-mode-denial]", r.stdout)
+
+
+class HostileInput(unittest.TestCase):
+    """In an interactive run the agent can write the transcript the monitor reads.
+    A line it can't trust must stop a session, never end the monitor's loop."""
+
+    # Valid records of a shape the monitor didn't expect: read past, never fatal.
+    ODD = {
+        "a text block whose text is a number":
+            b'{"type":"assistant","message":{"content":[{"type":"text","text":1}]}}\n',
+        "a tool_use whose input is a number":
+            b'{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":5}]}}\n',
+        "a message that is a list": b'{"type":"user","message":[1]}\n',
+    }
+    # Lines that aren't transcript records: a session stops on them.
+    BAD = {
+        "invalid UTF-8": b"\xff\xfe not text\n",
+        "deeply nested JSON": b"[" * 100000 + b"]" * 100000 + b"\n",
+        "an init record": b'{"type":"system","subtype":"init"}\n',
+        "JSON that isn't an object": b"[1, 2, 3]\n",
+        "a line that isn't JSON": b"hello\n",
+    }
+
+    def run_monitor(self, data, *args):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.jsonl")
+            r = subprocess.run([sys.executable, "-I", MONITOR, "--out", out, "--quiet", *args],
+                               input=data, capture_output=True)
+            with open(out, "rb") as f:
+                written = f.read()
+        return r.returncode, written, r.stderr
+
+    def test_a_bad_line_stops_a_session_and_is_kept_as_evidence(self):
+        for name, bad in self.BAD.items():
+            with self.subTest(name):
+                data = stream(prompt("go")).encode() + bad + stream(prompt("now", "acceptEdits")).encode()
+                rc, written, err = self.run_monitor(data, "--session")
+                self.assertEqual(rc, 7, err)
+                self.assertTrue(written.startswith(stream(prompt("go")).encode() + bad),
+                                "the evidence copy keeps the bad line byte for byte")
+
+    def test_an_odd_record_never_hides_what_follows_it(self):
+        for name, odd in self.ODD.items():
+            with self.subTest(name):
+                data = stream(prompt("go")).encode() + odd + stream(prompt("now", "acceptEdits")).encode()
+                rc, written, err = self.run_monitor(data, "--session")
+                self.assertEqual(rc, 3, err)
+                self.assertEqual(written, data)
+
+    def test_a_bad_line_in_a_headless_stream_is_skipped(self):
+        for name, bad in {**self.ODD, **self.BAD}.items():
+            if name == "an init record":
+                continue
+            with self.subTest(name):
+                data = stream(init()).encode() + bad + stream(call(1, "Bash", command="make"),
+                                                               result(1, "ok")).encode()
+                rc, written, err = self.run_monitor(data)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(written, data)
+
+    def test_size_limits_stop_the_run(self):
+        long_line = stream(prompt("x" * 500)).encode()
+        self.assertEqual(self.run_monitor(long_line, "--session", "--max-line-bytes", "100")[0], 7)
+        many = stream(*[prompt("go")] * 50).encode()
+        self.assertEqual(self.run_monitor(many, "--session", "--max-total-bytes", "1000")[0], 7)
+
+    def test_the_view_can_go_to_a_log_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "view.log")
+            data = stream(prompt("go"), prompt("again", "plan")).encode()
+            rc, _, _ = self.run_monitor(data, "--session", "--log", log)
+            with open(log) as f:
+                view = f.read()
+        self.assertEqual(rc, 3)
+        self.assertIn("STOP: a prompt was sent in permission mode 'plan'", view)
+
+    def test_scan_reports_lines_it_cannot_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "wb") as f:
+                f.write(stream(init()).encode() + b'{"type": "assistant", "mess\n'
+                        + self.BAD["deeply nested JSON"] + stream(call(1, "Bash", command="make")).encode())
+            r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(r.stdout.count("[unreadable-line]"), 2)
+
+
 
 # Window title (OSC 0, ended by BEL), clear screen, cursor up, a C1 control
 # sequence introducer, and a right-to-left override.

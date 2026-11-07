@@ -207,6 +207,7 @@ else
     4) note "Stopped: denial budget spent." ;;
     5) note "Stopped: no init message (did claude start?)." ;;
     6) note "Stopped: the init message didn't say which permission mode it ran in." ;;
+    7) note "Stopped: the transcript passed the monitor's size limits." ;;
   esac
   rc=$(( monitor_rc != 0 ? monitor_rc : remote_rc ))
 fi
