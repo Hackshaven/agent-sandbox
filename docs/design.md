@@ -37,7 +37,7 @@ Docker still has a job: rootless Docker runs local targets *inside* the sandbox 
 | Setup phase, then attack phase | Tools installed with internet in `install`; `cutover` is permanent; changes go through `reopen` and a re-check | `sandbox-setup.sh` |
 | Test the sandbox before relying on it | Config checks, hand checks and a supervised escape test, repeated after any sandbox or model change | `agentlab-check.sh`, `templates/escape-test.md` |
 | Keep transcripts and logs 30+ days, review them | 45-day retention; per-run evidence folder; pattern scan; new proxy refusals and firewall denies printed after each run | `gateway-setup.sh`, `agentlab-run`, `agentlab-scan.py` |
-| Stop on repeated denials | Monitor ends a run after 3 denials in a row or 20 total, and if the run isn't in auto mode | `agentlab-monitor.py` |
+| Stop on repeated denials | Monitor ends a run after 3 denials in a row or 20 total, and if the run isn't in auto mode or doesn't say which mode it's in. Interactive runs too: `agentlab-run` feeds it the session transcript and ends the session when it stops | `agentlab-monitor.py`, `agentlab-run` |
 | Scope stated as intent in every task | Runs refuse a task file without a `## Scope` section | `agentlab-run`, `templates/task-template.md` |
 
 The firewall logs every protocol, not just refused HTTPS. That closes a gap the
@@ -54,6 +54,7 @@ proxy log line.
 | Proxy forwards model calls only | The path allowlist is a starting guess | Tune it from 403 lines after the first real run |
 | Treat auto mode rules as security config | Root-owned managed settings; the agent isn't root | Recheck `claude auto-mode config` after every Claude Code update |
 | Orchestrator on the trusted side | An interactive run puts the agent's terminal on yours, escape sequences included; nothing filters a live session | Prefer headless runs for anything long or unwatched |
+| Stop runs that leave auto mode | An interactive session's mode is read from each prompt in its transcript, so a mode change mid-turn shows at the next prompt | The operator is watching an interactive run by definition; the scan flags any prompt outside auto mode afterward |
 
 Whatever the agent sends to the model, including target code and findings, leaves
 the network in request bodies the proxy doesn't log.

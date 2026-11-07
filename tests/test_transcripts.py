@@ -44,6 +44,14 @@ def result(i, text, error=False):
          "content": [{"type": "text", "text": text}], "is_error": error}]}}
 
 
+def prompt(text, mode="auto"):
+    """A prompt as a session transcript records it, with the mode it was sent in."""
+    m = {"type": "user", "message": {"role": "user", "content": text}}
+    if mode is not None:
+        m["permissionMode"] = mode
+    return m
+
+
 DENIAL = "Permission to use Bash has been denied by the auto mode classifier"
 
 
@@ -119,6 +127,28 @@ class ScanRules(unittest.TestCase):
             self.assertIn("[sensitive-path]", r.stdout)
             self.assertIn("1 auto mode denials", r.stdout)
 
+    def test_scan_flags_runs_outside_auto_mode(self):
+        no_mode = init()
+        del no_mode["permissionMode"]
+        for name, msgs in {
+            "init in default mode": [init("default")],
+            "init with no mode": [no_mode],
+            "prompt in acceptEdits": [prompt("go"), prompt("again", "acceptEdits")],
+        }.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "t.jsonl")
+                with open(path, "w") as f:
+                    f.write(stream(*msgs))
+                r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIn("[not-auto-mode]", r.stdout)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(stream(prompt("go"), call(1, "Bash", command="make"), result(1, "ok")))
+            r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout)
+
 
 class Monitor(unittest.TestCase):
     def run_monitor(self, text, *args):
@@ -173,6 +203,43 @@ class Monitor(unittest.TestCase):
     def test_missing_init_fails_when_required(self):
         rc, _ = self.run_monitor(stream(call(1, "Bash", command="x")), "--require-init")
         self.assertEqual(rc, 5)
+
+    def test_stops_when_init_has_no_permission_mode(self):
+        no_mode = init()
+        del no_mode["permissionMode"]
+        rc, _ = self.run_monitor(stream(no_mode, call(1, "Bash", command="make")), "--require-init")
+        self.assertEqual(rc, 6)
+
+
+class SessionMonitor(unittest.TestCase):
+    """Interactive runs: agentlab-run feeds the monitor the session transcript."""
+
+    def run_session(self, *msgs):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.jsonl")
+            r = subprocess.run([sys.executable, "-I", MONITOR, "--out", out, "--quiet", "--session"],
+                               input=stream(*msgs), capture_output=True, text=True)
+        return r.returncode
+
+    def test_a_session_in_auto_mode_finishes(self):
+        self.assertEqual(self.run_session(prompt("go"), call(1, "Bash", command="make"), result(1, "ok"),
+                                          prompt("thanks")), 0)
+
+    def test_a_prompt_outside_auto_mode_stops_the_session(self):
+        for mode in ("default", "acceptEdits", "plan", "bypassPermissions"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.run_session(prompt("go"), call(1, "Bash", command="make"),
+                                                  result(1, "ok"), prompt("next", mode)), 3)
+
+    def test_a_session_that_never_records_its_mode_is_not_confirmed(self):
+        self.assertEqual(self.run_session(prompt("go", None), call(1, "Bash", command="make")), 6)
+        self.assertEqual(self.run_session(), 6)
+
+    def test_the_denial_budget_applies_to_sessions(self):
+        msgs = [prompt("go")]
+        for i in range(3):
+            msgs += [call(i, "Bash", command="curl https://example.com"), result(i, DENIAL, error=True)]
+        self.assertEqual(self.run_session(*msgs), 4)
 
 
 

@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""agentlab-monitor: watch a Claude Code stream-json run as it happens.
+"""agentlab-monitor: watch a Claude Code run as it happens.
 
-Reads stream-json lines on stdin, writes each line unchanged to --out as it
-arrives, prints a compact view to the terminal, and stops the run (exits
-non-zero, which closes the pipe) when:
+Reads JSON lines on stdin, writes each line unchanged to --out as it arrives,
+prints a compact view to the terminal, and stops the run (exits non-zero,
+which closes the pipe) when:
 
-  - the init message reports a permission mode other than "auto"
+  - the init message reports a permission mode other than "auto", or none
+  - a prompt in the transcript records a permission mode other than "auto"
   - auto mode denies too many tool calls in a row, or in total
 
-Exit codes: 0 finished, 3 not in auto mode, 4 denial budget spent,
-5 no init message seen.
+Headless runs feed it stream-json, whose init message carries the mode.
+Interactive runs feed it the session transcript Claude Code writes (--session),
+where each prompt carries the mode in force when it was sent; agentlab-run
+ends the session when the monitor stops.
 
-The denial text Claude Code uses isn't documented here, so the patterns are a
-best guess. Check them against the first real denial you see in a transcript
-and adjust --deny-pattern if needed.
+Exit codes: 0 finished, 3 not in auto mode, 4 denial budget spent,
+5 no init message seen, 6 auto mode not confirmed (an init message with no
+permissionMode, or with --session, no prompt that records one).
+
+Neither the denial text nor these permissionMode fields are documented here.
+The patterns and fields are what one Claude Code version writes. Check them
+against the first real transcript and adjust --deny-pattern if needed.
 """
 import argparse
 import json
@@ -84,13 +91,16 @@ def main():
     ap.add_argument("--unavailable-pattern", default=DEFAULT_UNAVAILABLE)
     ap.add_argument("--require-init", action="store_true",
                     help="fail (exit 5) if the stream ends with no init message")
+    ap.add_argument("--session", action="store_true",
+                    help="input is a Claude Code session transcript (an interactive run): "
+                         "fail (exit 6) at the end if no prompt confirmed auto mode")
     ap.add_argument("--quiet", action="store_true", help="no terminal view")
     args = ap.parse_args()
 
     deny_re = re.compile(args.deny_pattern)
     unavail_re = re.compile(args.unavailable_pattern)
     denials = consecutive = unavailable = tool_calls = 0
-    saw_init = False
+    saw_init = confirmed = False
     turn = 0
 
     def show(msg):
@@ -119,11 +129,21 @@ def main():
                 show(f"[init] model={msg.get('model', '?')} permissionMode={mode or '?'} "
                      f"cwd={msg.get('cwd', '?')}")
                 if mode is None:
-                    show("  ! init message has no permissionMode field; can't confirm auto mode")
-                elif mode != "auto":
+                    show("  ! STOP: init message has no permissionMode field, so auto mode can't be confirmed")
+                    return 6
+                if mode != "auto":
                     show(f"  ! STOP: permission mode is '{mode}', not 'auto'")
                     return 3
+                confirmed = True
                 continue
+
+            # Prompts in a session transcript record the mode they were sent in.
+            if mtype == "user" and "permissionMode" in msg:
+                mode = msg.get("permissionMode")
+                if mode != "auto":
+                    show(f"  ! STOP: a prompt was sent in permission mode '{mode}', not 'auto'")
+                    return 3
+                confirmed = True
 
             body = msg.get("message") or {}
             content = body.get("content") if isinstance(body, dict) else None
@@ -169,6 +189,9 @@ def main():
     if args.require_init and not saw_init:
         show("  ! stream ended without an init message")
         return 5
+    if args.session and not confirmed:
+        show("  ! no prompt in the session transcript confirmed auto mode")
+        return 6
     return 0
 
 

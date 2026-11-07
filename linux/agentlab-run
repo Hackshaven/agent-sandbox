@@ -149,7 +149,35 @@ collect() {
   done
   echo "ended=$(date -Is)" >> "$RUN_DIR/meta.txt"
 }
-trap 'echo; note "Interrupted: stopping the agent"; stop_remote; collect; exit 130' INT TERM
+# Interactive runs: follow the transcript Claude Code writes on the sandbox through
+# agentlab-monitor, and end the session if it leaves auto mode or spends the denial
+# budget. The remote side finds the session's claude process (oldest named claude)
+# and the newest transcript written since it started looking, and tail --pid ends
+# when that process does.
+WATCH_REMOTE='t0="$(date +%s)"; p=""
+for _ in $(seq 1 60); do p="$(pgrep -o -x -u "$(id -u)" claude)"; [ -n "$p" ] && break; sleep 1; done
+[ -n "$p" ] || exit 0
+while kill -0 "$p" 2>/dev/null; do
+  f="$(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -name "*.jsonl" -newermt "@$t0" \
+       -printf "%T@ %p\n" 2>/dev/null | sort -n | tail -1 | cut -d" " -f2-)"
+  [ -n "$f" ] && exec tail --pid="$p" -n +1 -F "$f" 2>/dev/null
+  sleep 1
+done'
+watch_pid=""
+watch_session() {   # runs in the background for the length of an interactive session
+  set +e
+  sbx "$WATCH_REMOTE" < /dev/null | agentlab-monitor --session --quiet --out "$RUN_DIR/session-transcript.jsonl"
+  local mrc=${PIPESTATUS[1]}
+  echo "watch_exit=$mrc" >> "$RUN_DIR/meta.txt"
+  case $mrc in 3|4) stop_remote ;; esac
+}
+stop_watch() {   # let the watcher finish once claude has exited, then make sure it has
+  [[ -n "$watch_pid" ]] || return 0
+  for _ in 1 2 3 4 5; do kill -0 "$watch_pid" 2>/dev/null || break; sleep 1; done
+  pkill -TERM -P "$watch_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
+}
+trap 'echo; note "Interrupted: stopping the agent"; stop_remote; stop_watch; collect; exit 130' INT TERM
 
 # ------------------------------------------------------------ launch
 REMOTE_ENV='set -a; . /etc/environment; set +a; cd /work/target'
@@ -157,6 +185,9 @@ rc=0
 if [[ $INTERACTIVE == 1 ]]; then
   say "Interactive session (time limit $TIME). You approve or supervise every step."
   note "Recording to $RUN_DIR/session.log"
+  note "agentlab-monitor follows the session transcript and ends the session if it"
+  note "leaves auto mode or spends the denial budget."
+  watch_session & watch_pid=$!
   script -q -f -e "$RUN_DIR/session.log" -c \
     "ssh ${SSH_OPTS[*]} -t agent@$SBX '$REMOTE_ENV; exec timeout --foreground --kill-after=30s $TIME claude --model $MODEL --permission-mode auto'" || rc=$?
 else
@@ -175,11 +206,22 @@ else
     3) note "Stopped: not running in auto mode." ;;
     4) note "Stopped: denial budget spent." ;;
     5) note "Stopped: no init message (did claude start?)." ;;
+    6) note "Stopped: the init message didn't say which permission mode it ran in." ;;
   esac
   rc=$(( monitor_rc != 0 ? monitor_rc : remote_rc ))
 fi
 trap - INT TERM
 stop_remote
+if [[ -n "$watch_pid" ]]; then
+  stop_watch
+  watch_rc="$(sed -n 's/^watch_exit=//p' "$RUN_DIR/meta.txt" | tail -1)"
+  case "$watch_rc" in
+    3) note "Stopped: a prompt was sent outside auto mode." ;;
+    4) note "Stopped: denial budget spent." ;;
+    6) note "The session transcript never confirmed auto mode. Read session.log." ;;
+  esac
+  [[ "$watch_rc" =~ ^[346]$ ]] && rc="$watch_rc"
+fi
 collect
 
 # ------------------------------------------------------------ review
@@ -196,8 +238,12 @@ if [[ "${deny_lines:-0}" != 0 ]]; then
   note "Firewall denies (first 20). Read this run's transcript first:"
   head -20 "$RUN_DIR/egress-deny.new.log" | sed 's/^/      /'
 fi
-if [[ -s "$RUN_DIR/transcript.jsonl" ]]; then
-  agentlab-scan "$RUN_DIR/transcript.jsonl" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
+transcripts=()
+for t in transcript.jsonl session-transcript.jsonl; do
+  [[ -s "$RUN_DIR/$t" ]] && transcripts+=("$RUN_DIR/$t")
+done
+if (( ${#transcripts[@]} )); then
+  agentlab-scan "${transcripts[@]}" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
   head -40 "$RUN_DIR/scan.txt" | sed 's/^/    /'
   (( scan_rc == 2 )) && note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt"
 fi

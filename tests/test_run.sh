@@ -65,8 +65,43 @@ check "agentlab-check checks the preflight's groups [$run_groups]" test "$check_
 check "sandbox-setup removes the preflight's groups [$run_groups]" test "$setup_groups" = "$run_groups"
 
 if [[ $EUID -ne 0 ]]; then
-  skip "not root: the preflight's route checks run in a network namespace (CI runs them with sudo)"
+  skip "not root: the session watcher and the preflight's route checks need namespaces (CI runs them with sudo)"
   finish; exit
+fi
+
+# The interactive session watcher, as shipped: the remote script agentlab-run sends
+# over SSH, run here against a stand-in claude process and transcript, piped into
+# agentlab-monitor --session as agentlab-run does. Its own PID namespace keeps
+# any real claude process on this machine out of its pgrep.
+WATCH="$(awk "/^WATCH_REMOTE='/ { f = 1; sub(/^WATCH_REMOTE='/, \"\") } f { print } f && /^done'\$/ { exit }" "$RUN" | sed "\$s/'\$//")"
+check "the session watcher script is found" grep -q 'tail --pid' <<<"$WATCH"
+if unshare --pid --fork --mount-proc true 2>/dev/null; then
+  watch_case() {   # watch_case NAME: run one scenario; prints the monitor's exit code
+    local home="$TMP/$1"
+    mkdir -p "$home/bin" "$home/.claude/projects/-work-target"
+    cp "$(command -v sleep)" "$home/bin/claude"
+    WATCH="$WATCH" MONITOR="$REPO/linux/agentlab-monitor.py" CASE="$1" HOME="$home" \
+      unshare --pid --fork --mount-proc bash -c '
+        prompt() { printf "{\"type\": \"user\", \"permissionMode\": \"%s\", \"message\": {\"content\": \"hi\"}}\n" "$1"; }
+        proj="$HOME/.claude/projects/-work-target"
+        [ "$CASE" = stale ] && { prompt default > "$proj/old.jsonl"; sleep 1.1; }
+        "$HOME/bin/claude" 60 & claude=$!
+        { bash -c "$WATCH" | python3 -I "$MONITOR" --session --quiet --out "$HOME/out.jsonl"
+          echo "${PIPESTATUS[1]}" > "$HOME/rc"; } &
+        sleep 1.5
+        prompt auto >> "$proj/new.jsonl"
+        [ "$CASE" = leaves ] && { sleep 1.5; prompt acceptEdits >> "$proj/new.jsonl"; }
+        sleep 2.5
+        kill "$claude"
+        for _ in $(seq 1 10); do [ -s "$HOME/rc" ] && break; sleep 0.5; done
+        cat "$HOME/rc" 2>/dev/null || echo none'
+  }
+  check "watcher: a session that stays in auto mode ends cleanly (0)" test "$(watch_case stays)" = 0
+  check "watcher: a prompt sent outside auto mode stops it (3)" test "$(watch_case leaves)" = 3
+  check "watcher: a transcript from before the session is ignored (0)" test "$(watch_case stale)" = 0
+  check "watcher: the gateway keeps a copy of what it followed" grep -q '"permissionMode": "auto"' "$TMP/stays/out.jsonl"
+else
+  skip "PID namespaces unavailable here; skipping the session watcher"
 fi
 NS=agentlab-test-preflight
 if ! ip netns add "$NS" 2>/dev/null; then

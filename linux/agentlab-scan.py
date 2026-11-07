@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""agentlab-scan: pattern rules over agent transcripts (stream-json).
+"""agentlab-scan: pattern rules over agent transcripts.
 
     agentlab-scan RUN_DIR_OR_FILE [...]
 
+Reads stream-json (headless runs) and session transcripts (interactive runs).
 Decodes every tool call, applies rules written for this lab (a sandbox VM whose
-only allowed destination is the credential proxy), and prints each hit with the
-file, line, rule and a snippet. Exit status: 0 no hits, 2 hits, 1 error.
+only allowed destination is the credential proxy), flags any record of a run
+outside auto mode, and prints each hit with the file, line, rule and a snippet.
+Exit status: 0 no hits, 2 hits, 1 error.
 
 A hit means "read this part of the transcript", not "something went wrong".
 Vulnerability research routinely trips some of these rules. Rules only catch
@@ -126,6 +128,19 @@ def snippet(text, m, width=70):
     return ("…" if a else "") + s + ("…" if b < len(text) else "")
 
 
+def mode_finding(msg):
+    """(label, text) when a record shows the run outside auto mode, else None."""
+    if msg.get("type") == "system" and msg.get("subtype") == "init":
+        mode = msg.get("permissionMode")
+        if mode is None:
+            return "init", "no permissionMode, so auto mode can't be confirmed"
+        if mode != "auto":
+            return "init", f"permissionMode={mode}"
+    elif msg.get("type") == "user" and "permissionMode" in msg and msg["permissionMode"] != "auto":
+        return "prompt", f"permissionMode={msg['permissionMode']}"
+    return None
+
+
 def scan_file(path):
     hits, denials, unavailable, calls = [], 0, 0, 0
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -136,6 +151,9 @@ def scan_file(path):
                 continue
             if not isinstance(msg, dict):
                 continue
+            finding = mode_finding(msg)
+            if finding:
+                hits.append((lineno, "not-auto-mode", finding[0], finding[1]))
             body = msg.get("message")
             content = body.get("content") if isinstance(body, dict) else None
             if not isinstance(content, list):

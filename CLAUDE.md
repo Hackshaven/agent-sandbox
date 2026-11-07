@@ -127,9 +127,11 @@ exists, the `Security Architect` is the gate for the boundary and the
 
 ## Still unverified
 
-The README's "Known limits" list is the source of truth. As of the first commit:
+The README's "Known limits" list is the source of truth. As of November 2026:
 `agentlab.ps1` has never run against Hyper-V; the auto mode denial text in
-`agentlab-monitor.py` and `agentlab-scan.py` is a guess; it's untested whether auto
-mode works with a custom `ANTHROPIC_BASE_URL` on this plan, which extra paths
-Claude Code requests, and whether `/etc/claude-code/managed-settings.json` is read.
-When one of these is confirmed or fixed, update that list.
+`agentlab-monitor.py` and `agentlab-scan.py` is a guess, and so are the
+`permissionMode` fields the monitor reads (stream-json init, session transcript
+prompts); it's untested whether auto mode works with a custom
+`ANTHROPIC_BASE_URL` on this plan, which extra paths Claude Code requests, and
+whether `/etc/claude-code/managed-settings.json` is read. When one of these is
+confirmed or fixed, update that list.

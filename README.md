@@ -119,9 +119,12 @@ That one command reverts the sandbox, delivers the task and target, runs Claude
 Code headless with your limits, collects the evidence, scans the transcript,
 prints any new proxy refusals and firewall denies, and reverts again.
 
-Add `-Interactive` for a supervised session instead (recorded on the gateway).
+Add `-Interactive` for a supervised session instead. It's recorded on the gateway,
+and `agentlab-monitor` follows its transcript and ends the session if a prompt is
+sent outside auto mode or the denial budget runs out.
 
-Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`,
+Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
+(headless) or `session.log` and `session-transcript.jsonl` (interactive),
 `claude-projects.tgz`, `credproxy.new.log`, `egress-deny.new.log` and `scan.txt`.
 Folders older than 45 days are pruned.
 
@@ -161,6 +164,11 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
 - The auto mode denial text in `agentlab-monitor` and `agentlab-scan` is a best
   guess. Check it against the first real denial in a transcript and adjust
   `--deny-pattern` if it doesn't match.
+- The monitor reads the permission mode from `permissionMode` in a headless run's
+  init message and on each prompt in an interactive run's session transcript, as
+  one Claude Code version writes them. If yours doesn't, a headless run stops at
+  init (exit 6) and an interactive one ends flagged as unconfirmed. Check the
+  first run of each kind.
 - Unverified until your first run: that auto mode works with a custom
   `ANTHROPIC_BASE_URL` on your plan, which extra paths Claude Code requests, and
   that `/etc/claude-code/managed-settings.json` is read (the sandbox check tests
