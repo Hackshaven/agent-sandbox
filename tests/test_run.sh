@@ -171,6 +171,17 @@ fi
 # namespace keeps the tests' pkill away from anything else on this machine.
 WATCH="$(heredoc_body "<<'WATCH'" "$RUN" WATCH)"
 check "the session watcher script is found" grep -q 'HEARTBEAT' <<<"$WATCH"
+# Two values the watcher and agentlab-monitor must agree on, written in both.
+same_value() {   # same_value REGEX: the first match in the watcher and in the monitor agree
+  local a b
+  a="$(grep -oE "$1" <<<"$WATCH" | head -1)"; b="$(grep -oE "$1" "$REPO/linux/agentlab-monitor.py" | head -1)"
+  [[ -n "$a" && "$a" == "$b" ]]
+}
+check "the watcher and the monitor agree on the heartbeat" same_value "^HEARTBEAT = b'[^']*'"
+check "the watcher and the monitor agree on the longest line" \
+  bash -c '[[ "$(grep -oE "^MAX_LINE = [0-9 *]+[0-9]" <<<"$1" | sed "s/^MAX_LINE = //")" == \
+    "$(grep -oE "max-line-bytes\", type=int, default=[0-9 *]+[0-9]" "$2" | sed "s/.*default=//")" ]]' \
+  _ "$WATCH" "$REPO/linux/agentlab-monitor.py"
 if unshare --pid --fork --mount-proc true 2>/dev/null; then
   # The stand-in session and the watcher run as nobody, as the agent's are not
   # root, so a folder or file made unreadable is unreadable to the watcher too.
@@ -222,6 +233,14 @@ for _ in range(40):
                   prompt auto > "$HOME/.claude/projects/x/d.jsonl"
                   touch -d @4102444800 "$HOME/.claude/projects/x/d.jsonl"
                   sleep 2.5; prompt acceptEdits >> "$proj/new.jsonl" ;;
+          flood)  mkdir -p "$HOME/.claude/projects/x"     # a decoy growing faster than it can be read
+                  python3 -I -c "import os, sys, time
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+end = time.time() + 5
+while time.time() < end:
+    os.write(fd, b\"{}\\n\" * 100000)
+    time.sleep(0.03)" "$HOME/.claude/projects/x/d.jsonl" &
+                  sleep 1.5; prompt acceptEdits >> "$proj/new.jsonl" ;;
           interleave)   # both followed first, then written at once (a shared pipe mixed these)
                   prompt auto >> "$proj/other.jsonl"; sleep 2
                   big "$proj/new.jsonl" & w1=$!; big "$proj/other.jsonl" & w2=$!; wait "$w1" "$w2" ;;
@@ -242,6 +261,8 @@ for _ in range(40):
   check "watcher: a decoy transcript can't hide the real one" test "$(watch_case decoy)" = "3 early"
   out="$(watch_case interleave)"
   check "watcher: large records from two transcripts written at once arrive whole [$out]" test "$out" = "0 held"
+  out="$(watch_case flood)"
+  check "watcher: a growing decoy can't hold it on one file [$out]" test "$out" = "3 early"
   out="$(watch_case stop)"
   check "watcher: a paused watcher goes quiet, and that stops it [$out]" test "$out" = "8 early"
   out="$(watch_case partial)"

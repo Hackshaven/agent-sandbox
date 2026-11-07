@@ -432,6 +432,8 @@ def scan_archive(path):
                 if member is None:
                     break
                 tar.members.clear()   # tarfile keeps every member it reads; these are kept here
+                if sum(len(k) + len(v) for k, v in tar.pax_headers.items()) > MAX_HEADER:
+                    raise StreamCap(f"global PAX headers passed {MAX_HEADER} bytes")   # tarfile keeps those too
                 count += 1
                 if stop is None and count > MAX_MEMBERS:
                     stop = f"more than {MAX_MEMBERS} members"

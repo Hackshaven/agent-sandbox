@@ -371,6 +371,44 @@ class ScanRules(unittest.TestCase):
         self.assertIn("a sparse file, not read", texts)
         self.assertTrue(any("a symbolic link to /tmp/hidden" in t for t in texts), texts)
 
+    def test_a_reread_of_earlier_data_counts_against_the_stream_cap(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            # Reading the link means seeking back past the filler, which gzip pays
+            # for by decompressing it all again from the start.
+            tgz = self.make_archive(d, {"p/filler.bin": "\0" * 2_000_000, "p/target.txt": stream(prompt("go"))},
+                                    links=[("p/s.jsonl", tarfile.LNKTYPE, "p/target.txt")])
+            restore = self.patched(MAX_STREAM_BYTES=3_000_000)
+            try:
+                found = list(scan.scan_archive(tgz))
+            finally:
+                restore()
+        kinds = [h[1] for _, (hits, *_) in found for h in hits]
+        self.assertIn("scan-incomplete", kinds, found)
+
+    def test_global_pax_headers_are_capped(self):
+        import gzip
+        import io
+        import tarfile
+        raw = io.BytesIO()
+        data = stream(prompt("go")).encode()
+        for i in range(40):   # each a different key, which tarfile keeps for the rest of the archive,
+            raw.write(tarfile.TarInfo._create_pax_generic_header(   # one per member so no one
+                {f"k{i}": "v" * 50000}, tarfile.XGLTYPE, "utf-8"))      # member's headers pass the cap
+            info = tarfile.TarInfo(f"p/a{i}.txt")
+            info.size = len(data)
+            raw.write(info.tobuf(tarfile.USTAR_FORMAT))
+            raw.write(data + b"\0" * (-len(data) % 512))
+        raw.write(b"\0" * 1024)
+        with tempfile.TemporaryDirectory() as d:
+            tgz = os.path.join(d, "claude-projects.tgz")
+            with gzip.open(tgz, "wb") as f:
+                f.write(raw.getvalue())
+            found = list(scan.scan_archive(tgz))
+        stop = found[-1][1][0][0]
+        self.assertEqual(stop[1], "scan-incomplete")
+        self.assertIn("global PAX headers passed", stop[3])
+
     def test_hits_come_first(self):
         with tempfile.TemporaryDirectory() as d:
             members = {f"p/quiet-{i:03}.jsonl": stream(prompt("go")) for i in range(60)}

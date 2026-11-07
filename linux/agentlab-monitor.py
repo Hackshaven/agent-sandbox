@@ -139,7 +139,7 @@ def main():
     ap.add_argument("--max-total-bytes", type=int, default=1024 * 1024 * 1024)
     ap.add_argument("--stall", type=int, default=0,
                     help="stop (exit 8) if no heartbeat (with --session) or no line (without) "
-                         "arrives for this many seconds; 0, the default, waits for ever")
+                         "arrives for this many seconds; 0, the default, waits forever")
     ap.add_argument("--log", help="write the view to this file instead of the terminal")
     ap.add_argument("--quiet", action="store_true", help="no terminal view")
     args = ap.parse_args()

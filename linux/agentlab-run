@@ -382,7 +382,9 @@ def main():
         send(HEARTBEAT)   # a whole pass, checks included, has finished
         if not more:
             time.sleep(1)
-    discover()   # the session has ended: send what's left
+    while one_pass(checking=False):   # the session has ended: send what's left,
+        send(HEARTBEAT)               # then look once more for a late transcript
+    discover()
     while one_pass(checking=False):
         send(HEARTBEAT)
     for path, entry in followed.items():
@@ -504,6 +506,11 @@ if [[ -n "$watch_pid" ]]; then
   watch_rc="$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
   watch_stop="$(sed -n 's/^watch_stop=\(.*\) at=.*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
   watch_unfinished="$(grep -c '^watch_unfinished=' "$RUN_DIR/meta.txt" || true)"
+  watch_remote="$(sed -n 's/^watch_remote_exit=\([0-9]*\).*/\1/p' "$RUN_DIR/meta.txt" | tail -1)"
+  case "$watch_remote" in   # the watcher's own refusals, which can come after the session
+    2|5|6|7) note "The watcher on the sandbox exited $watch_remote, so treat the session as unwatched; watch.log says why." ;;
+    *) watch_remote="" ;;
+  esac
   [[ -n "$watch_stop" ]] && note "The watcher ended the session: $watch_stop."
   [[ "$watch_unfinished" != 0 ]] && note "The watcher hadn't finished ${WATCH_GRACE}s after the session ended, so its last records were checked only by the scan below."
   case "$watch_rc" in
@@ -519,7 +526,7 @@ if [[ -n "$watch_pid" ]]; then
   [[ -s "$RUN_DIR/session-monitor.log" ]] && note "The watcher's view: $RUN_DIR/session-monitor.log"
   case "$watch_rc" in
     3|4|7|8) rc="$watch_rc" ;;
-    *) if [[ -n "$watch_stop" || "$watch_unfinished" != 0 ]]; then rc=8   # lost, even unconfirmed
+    *) if [[ -n "$watch_stop" || -n "$watch_remote" || "$watch_unfinished" != 0 ]]; then rc=8   # lost
        elif [[ "$watch_rc" != 0 ]]; then rc="${watch_rc:-1}"; fi ;;
   esac
 fi
