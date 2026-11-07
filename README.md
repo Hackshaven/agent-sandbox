@@ -29,6 +29,7 @@ Pro, Enterprise or Education.
 | `templates/` | — | Task template and the escape test |
 | `tests/` | Linux or CI | Firewall, proxy and transcript-tool tests (see Testing) |
 | `docs/` | — | Design rationale, layout diagram, sources |
+| `.claude/agents/` | Claude Code sessions | Review agents from the agency-agents catalog, routed in `CLAUDE.md` |
 
 Read the scripts before you run them. They are short, and they draw the boundary.
 
