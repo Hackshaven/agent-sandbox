@@ -67,36 +67,49 @@ escape test verify a real build.
 - **This file wins.** Where an agent's general advice conflicts with the rules
   above (a vault for the token, a prefix location to clear a 403, bypass mode to
   get a run going), this file wins. Where a doc describes the code and the code
-  disagrees, the code wins and the mismatch is a finding.
+  disagrees, report the mismatch and let the owner decide which is right. Never
+  rewrite a statement of the boundary to match weaker code.
 - **No probing the lab.** Reviewers work in the host session and never connect to
   the lab VMs. A probe runs in `tests/` (network namespaces, a mock upstream) or
-  becomes an attempt in `templates/escape-test.md`.
+  becomes an attempt in `templates/escape-test.md`. Only this instruction stops
+  them: the agent files carry no tool restrictions.
 - **Don't hand-edit the agent files.** The Agency Agents app recognizes each by its
   exact content and restores the catalog's copy on its next Update, so change them
   in the catalog. `.gitattributes` keeps them LF so a Windows checkout matches.
 
 | If the change touches… | Run |
 |---|---|
-| nftables, sysctl and netplan in `gateway-setup.sh`; `phase_cutover` in `sandbox-setup.sh`; `tests/test_firewall.sh` | `Security Architect`, `Code Reviewer`, `Network Engineer`; `Penetration Tester` as second reader |
-| The nginx site and upstream heredocs in `gateway-setup.sh`; `tests/test_proxy.sh` | `Security Architect`, `Code Reviewer`; `Penetration Tester` as second reader |
-| The token: its section of `gateway-setup.sh`, the proxy's auth and header-stripping lines and `log_format`, the sandbox's placeholder, the token checks in `agentlab-check.sh` and the `agentlab-run` preflight, `.gitignore`, any token-shaped test value | `Secrets & Credential Hygiene Engineer`, `Code Reviewer` |
-| Managed settings: `write_managed_settings` and `phase_finalize` in `sandbox-setup.sh`, their checks in `agentlab-check.sh`, the monitor's `permissionMode` check, `--permission-mode` in `agentlab-run` | `Security Architect`, `Code Reviewer`; `Prompt Engineer` for rule text |
-| Sandbox isolation: `agentlab.ps1` `build`, `cutover`, `reopen` and `check`; `phase_install` and `install_rootless_docker` in `sandbox-setup.sh`; the sandbox half of `agentlab-check.sh` | `Security Architect`, `Code Reviewer`; `Penetration Tester` as second reader |
-| Run limits and refusals in `agentlab-run` and `agentlab.ps1 run`; `templates/task-template.md` | `Code Reviewer`, `Security Architect`; `Prompt Engineer` for the template |
+| nftables, sysctl, netplan and interface detection in `gateway-setup.sh`; `phase_cutover` in `sandbox-setup.sh`; the network checks in `agentlab-check.sh`; `tests/test_firewall.sh` | `Security Architect`, `Code Reviewer`, `Network Engineer`; `Penetration Tester` as second reader |
+| The nginx site and upstream heredocs in `gateway-setup.sh`; `tests/test_proxy.sh`. A new path goes in the heredoc, never only in the live config | `Security Architect`, `Code Reviewer`; `Penetration Tester` as second reader |
+| The token: its section of `gateway-setup.sh`, the proxy's auth and header-stripping lines and `log_format`, the sandbox's placeholder and `ANTHROPIC_API_KEY` removal, the token checks in `agentlab-check.sh` and the `agentlab-run` preflight, the token assertions in `tests/test_proxy.sh`, `.gitignore`, any token-shaped test value, the README's rotation step | `Secrets & Credential Hygiene Engineer`, `Security Architect`, `Code Reviewer` |
+| The SSH section of `gateway-setup.sh` (the run key), `SSH_OPTS` in `agentlab-run`, the restricted `authorized_keys` line in `phase_install` | `Secrets & Credential Hygiene Engineer`, `Security Architect` |
+| Managed settings: `write_managed_settings` and `phase_finalize` in `sandbox-setup.sh`, their checks in `agentlab-check.sh`, the monitor's `permissionMode` handling, `--permission-mode` in `agentlab-run` | `Security Architect`, `Code Reviewer`; `Prompt Engineer` for rule text |
+| Sandbox isolation: `agentlab.ps1` `build`, `cutover`, `reopen` and `check`; `phase_install`, `install_rootless_docker` and `phase_reopen` in `sandbox-setup.sh`; the rest of the sandbox half of `agentlab-check.sh` | `Security Architect`, `Code Reviewer`; `Penetration Tester` as second reader |
+| Run limits, refusals and the run lifecycle: validation, preflight, input delivery, launch, `stop_remote` and the trap in `agentlab-run`; `agentlab.ps1` `run`, `stop`, `revert` and `baseline`; `templates/task-template.md` | `Code Reviewer`, `Security Architect`; `Prompt Engineer` for the template |
 | `agentlab-scan.py`, the monitor's denial patterns and budgets, `tests/test_transcripts.py` | `Threat Detection Engineer`, plus the `Code Reviewer` for code |
-| Anything on the gateway that prints, parses or unpacks sandbox output: the monitor's terminal view, `scan.txt`, `claude-projects.tgz` | `Security Architect` |
-| Evidence and retention: `collect()` and the review block in `agentlab-run`, the logging section of `gateway-setup.sh`, the README's "A hit during a run" | `Incident Responder`, plus the `Code Reviewer` for code |
-| `templates/escape-test.md` | `Penetration Tester`, `Prompt Engineer` |
+| Anything on the gateway that prints, parses or unpacks sandbox output: the monitor's view, `scan.txt`, the review block and preflight echoes in `agentlab-run`, the interactive session, the "Logs" output of `agentlab-check gateway`, `claude-projects.tgz` | `Security Architect` |
+| Evidence and retention: `collect()`, the run folder and the review block in `agentlab-run`, the transcript the monitor writes, the logging section of `gateway-setup.sh`, the README's "A hit during a run" | `Incident Responder`, plus the `Code Reviewer` for code |
+| `templates/escape-test.md` | `Penetration Tester`; `Prompt Engineer` for the wording |
 | Any other part of `agentlab-check.sh` | `Code Reviewer`, plus the reviewer for what the check covers |
+| `tests/lib.sh`, `tests/run-all.sh` | `Code Reviewer`, plus the `Security Architect` when a change alters what the boundary tests render |
+| The boundary and "Still unverified" sections of this file; the README's "Known limits" and "Testing" | `Security Architect`, then the owner |
 | The README's build, run and maintenance steps | `Technical Writer` |
-| `docs/design.md` | `Security Architect` |
-| Anything else in `linux/`, `windows/`, `tests/` or `.github/` | `Code Reviewer` |
+| `docs/design.md`, `docs/lab-layout.svg`, `docs/sources.md` | `Security Architect` |
+| Anything else in `linux/`, `windows/`, `tests/` or `.github/`, and `.gitattributes` | `Code Reviewer` |
+
+A merged gateway change takes effect only after `linux/` is copied to the gateway
+again and `gateway-setup.sh` is rerun, because that script writes the firewall and
+proxy config and installs copies of the `agentlab-*` commands.
 
 The `Codebase Archaeologist` runs quarterly and after a Claude Code update. It
 checks "Still unverified" below and the README's "Known limits" against the
-evidence, the guidance table in `docs/design.md` against the scripts, and the
-constants repeated across scripts against each other. They repeat on purpose:
-each script is installed on its own, so drift is the finding, not repetition.
+evidence, the guidance table in `docs/design.md` against the scripts,
+`docs/sources.md` against guidance pages that may have moved, and the values
+repeated across scripts (addresses, `MIN_CLAUDE`, the managed-settings path, the
+privileged groups, the denial patterns, retention, limit validation) against each
+other. The installed commands are copied one by one into `/usr/local/bin` or
+`/usr/local/sbin`, where none can source a sibling file, so drift between copies
+is the finding.
 
 No catalog agent knows agent containment. The runbook proposes one. Until it
 exists, the `Security Architect` is the gate for the boundary and the
