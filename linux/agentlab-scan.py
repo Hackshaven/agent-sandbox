@@ -253,10 +253,12 @@ class BoundedStream:
             self.header_left = None
 
     def read(self, n=-1):
-        if n is None or n < 0 or n > MAX_READ:
+        if n is None or n < 0:
+            raise StreamCap("a read of the whole stream, which an archive read never needs")
+        if self.header_left is not None and n > self.header_left:   # whether tarfile asks
+            raise StreamCap(f"a member's headers passed {MAX_HEADER} bytes")   # in one go or in chunks
+        if n > MAX_READ:
             raise StreamCap(f"a read of {n} bytes, over the {MAX_READ}-byte cap")
-        if self.header_left is not None and n > self.header_left:
-            raise StreamCap(f"a member's headers passed {MAX_HEADER} bytes")
         data = self.raw.read(n)
         self._spend(len(data))
         if self.header_left is not None:
