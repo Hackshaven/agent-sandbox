@@ -234,6 +234,67 @@ class ScanRules(unittest.TestCase):
         self.assertEqual(hits[0][1], "unreadable-line")
         self.assertIn("over the cap", hits[0][3])
 
+    def patched(self, **values):
+        """Set scanner limits for one test; returns a function that restores them."""
+        saved = {k: getattr(scan, k) for k in values}
+        for k, v in values.items():
+            setattr(scan, k, v)
+        return lambda: [setattr(scan, k, v) for k, v in saved.items()]
+
+    def test_the_rest_of_an_overlong_line_counts_against_the_budget(self):
+        with tempfile.TemporaryDirectory() as d:
+            tgz = self.make_archive(d, {"p/a.jsonl": "x" * 5000 + "\n" + stream(prompt("go"))})
+            restore = self.patched(MAX_LINE=100, MAX_ARCHIVE_BYTES=1000)
+            try:
+                (label, (hits, *_)), = list(scan.scan_archive(tgz))
+            finally:
+                restore()
+        kinds = [h[1] for h in hits]
+        self.assertEqual(kinds, ["unreadable-line", "unreadable-archive"], hits)
+        self.assertIn("passed 1000 bytes", hits[1][3])
+
+    def test_members_the_scan_skips_count_against_the_stream_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            tgz = self.make_archive(d, {"p/blob.bin": "\0" * 3_000_000, "p/a.jsonl": stream(prompt("go"))})
+            restore = self.patched(MAX_STREAM_BYTES=1_000_000)
+            try:
+                results = list(scan.scan_archive(tgz))
+            finally:
+                restore()
+        (label, (hits, *_)), = results
+        self.assertEqual(hits[0][1], "unreadable-archive")
+        self.assertIn("decompressed past 1000000 bytes", hits[0][3])
+
+    def test_an_oversized_header_is_refused_before_it_is_read(self):
+        import io
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tgz = os.path.join(d, "claude-projects.tgz")
+            with tarfile.open(tgz, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+                data = stream(prompt("go")).encode()
+                info = tarfile.TarInfo("p/a.jsonl")
+                info.size = len(data)
+                info.pax_headers = {"comment": "c" * (2 * 1024 * 1024)}
+                tar.addfile(info, io.BytesIO(data))
+            (label, (hits, *_)), = list(scan.scan_archive(tgz))
+        self.assertEqual(hits[0][1], "unreadable-archive")
+        self.assertIn("a member's headers passed 1048576 bytes", hits[0][3])
+
+    def test_a_hard_link_to_nothing_before_it_is_reported(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tgz = self.make_archive(d, {"p/later.txt": "hello\n"},
+                                    links=[("p/s.jsonl", tarfile.LNKTYPE, "p/missing.txt")])
+            (label, (hits, *_)), = list(scan.scan_archive(tgz))
+        self.assertEqual(hits[0][1], "unreadable-line")
+        self.assertIn("a hard link to no file before it", hits[0][3])
+
+    def test_invalid_utf8_is_reported_and_still_scanned(self):
+        line = json.dumps(call(1, "Bash", command="ping 10.77.0.1")).encode().replace(b"ping", b"\xffping")
+        hits, *_ = scan.scan_lines([line + b"\n"])
+        kinds = sorted(h[1] for h in hits)
+        self.assertEqual(kinds, ["lab-network", "unreadable-line"], hits)
+
     def test_hits_come_first(self):
         with tempfile.TemporaryDirectory() as d:
             members = {f"p/quiet-{i:03}.jsonl": stream(prompt("go")) for i in range(60)}

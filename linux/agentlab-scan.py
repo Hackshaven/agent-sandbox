@@ -16,8 +16,10 @@ A hit means "read this part of the transcript", not "something went wrong".
 Vulnerability research routinely trips some of these rules. Rules only catch
 what someone anticipated, so also read a random sample of runs with no hits.
 """
+import gzip
 import json
 import os
+import posixpath
 import re
 import sys
 import tarfile
@@ -204,44 +206,154 @@ def scan_record(msg, lineno, counts, hits):
 
 MAX_LINE = 16 * 1024 * 1024             # one record, as in agentlab-monitor
 MAX_MEMBER = 256 * 1024 * 1024          # one transcript in an archive
-MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024   # transcript bytes read from one archive
+MAX_STREAM_BYTES = 4 * 1024 * 1024 * 1024    # the whole decompressed archive: headers,
+                                             # skipped members and rereads included
+MAX_READ = 1024 * 1024                  # one read tarfile asks for
+MAX_HEADER = 1024 * 1024                # one member's headers, PAX and long names included
 MAX_MEMBERS = 10000
-OVER_BUDGET = object()
+MAX_NAME = 4096                         # longest member name kept for hard-link lookups
 
 
-def read_lines(f, limit=MAX_LINE, budget=None):
+class Stop:
+    """Yielded by read_lines, and the last thing it yields, when an archive's
+    limits or a read error end it."""
+    def __init__(self, reason):
+        self.reason = reason
+
+
+class StreamCap(Exception):
+    pass
+
+
+class BoundedStream:
+    """The decompressed archive as tarfile reads it. tarfile decompresses members
+    it skips, and reads a member's PAX and long-name headers into memory, before
+    any member check can run. So every byte it decompresses, skipped or reread,
+    counts against MAX_STREAM_BYTES, a member's headers (read inside headers())
+    against MAX_HEADER, and one read may ask for at most MAX_READ, each checked
+    before the read or seek is done."""
+    def __init__(self, raw):
+        self.raw = raw
+        self.left = MAX_STREAM_BYTES
+        self.header_left = None
+
+    def _spend(self, n):
+        self.left -= n
+        if self.left < 0:
+            raise StreamCap(f"decompressed past {MAX_STREAM_BYTES} bytes")
+
+    def headers(self, read_member):
+        """Return read_member() (tarfile reading the next member's headers) with
+        what those headers may read capped."""
+        self.header_left = MAX_HEADER
+        try:
+            return read_member()
+        finally:
+            self.header_left = None
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n > MAX_READ:
+            raise StreamCap(f"a read of {n} bytes, over the {MAX_READ}-byte cap")
+        if self.header_left is not None and n > self.header_left:
+            raise StreamCap(f"a member's headers passed {MAX_HEADER} bytes")
+        data = self.raw.read(n)
+        self._spend(len(data))
+        if self.header_left is not None:
+            self.header_left -= len(data)
+        return data
+
+    def seek(self, offset, whence=0):
+        here = self.raw.tell()
+        if whence == 0:
+            target = offset
+        elif whence == 1:
+            target = here + offset
+        else:
+            raise StreamCap("a seek from the end, which an archive read never needs")
+        # Forward, gzip decompresses what it skips; back, it starts over from byte 0.
+        self._spend(target - here if target >= here else target)
+        return self.raw.seek(target)
+
+    def tell(self):
+        return self.raw.tell()
+
+
+def read_lines(f, limit=None, budget=None):
     """Yield each line of a binary file, None for one longer than limit (newline
-    included, as agentlab-monitor counts it), and OVER_BUDGET, then stop, once
-    budget["left"] bytes have been read."""
+    included, as agentlab-monitor counts it). With a budget (an archive member),
+    every byte read counts against budget["left"], the rest of an overlong line
+    included, and a Stop ends the lines once it runs out or a read fails; the
+    lines before it are kept."""
+    limit = MAX_LINE if limit is None else limit
+
+    def spend(raw):
+        if budget is None:
+            return None
+        budget["left"] -= len(raw)
+        if budget["left"] < 0:
+            budget["stopped"] = True
+            return Stop(f"passed {MAX_ARCHIVE_BYTES} bytes of transcripts; stopped")
+        return None
+
+    def readline():
+        if budget is None:
+            return f.readline(limit + 1)
+        try:
+            return f.readline(limit + 1)
+        except Exception as e:  # the stream's caps, or zlib and tar errors mid-member
+            budget["stopped"] = True
+            return Stop(f"{type(e).__name__}: {e}; stopped")
+
     while True:
-        raw = f.readline(limit + 1)
+        raw = readline()
+        if isinstance(raw, Stop):
+            yield raw
+            return
         if not raw:
             return
-        if budget is not None:
-            budget["left"] -= len(raw)
-            if budget["left"] < 0:
-                yield OVER_BUDGET
-                return
+        stop = spend(raw)
+        if stop:
+            yield stop
+            return
         if len(raw) > limit:
-            while raw and not raw.endswith(b"\n"):   # skip the rest of it
-                raw = f.readline(limit + 1)
+            while not raw.endswith(b"\n"):   # skip the rest of it
+                raw = readline()
+                if isinstance(raw, Stop):
+                    yield None
+                    yield raw
+                    return
+                if not raw:
+                    break
+                stop = spend(raw)
+                if stop:
+                    yield None
+                    yield stop
+                    return
             yield None
             continue
         yield raw
 
 
 def scan_lines(lines):
-    """Scan an iterable of transcript lines (bytes or str; None for one too long)."""
+    """Scan an iterable of transcript lines (bytes or str; None for one too long;
+    a Stop ends it)."""
     hits, counts = [], {"calls": 0, "denials": 0, "unavailable": 0}
     for lineno, raw in enumerate(lines, 1):
         if raw is None:
             hits.append((lineno, "unreadable-line", "line", f"longer than {MAX_LINE} bytes"))
             continue
-        if raw is OVER_BUDGET:
-            hits.append((lineno, "unreadable-archive", "archive", f"passed {MAX_ARCHIVE_BYTES} bytes; stopped"))
+        if isinstance(raw, Stop):
+            hits.append((lineno, "unreadable-archive", "archive", raw.reason))
             break
         if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Claude Code writes UTF-8, so a bad byte is worth reading by hand.
+                # Scan what can be read anyway.
+                hits.append((lineno, "unreadable-line", "line", "not valid UTF-8"))
+                raw = raw.decode("utf-8", errors="replace")
         if not raw.strip():
             continue
         try:
@@ -271,33 +383,54 @@ def finding(kind, label, text):
 
 def scan_archive(path):
     """Yield (label, result) for each .jsonl file in a tar archive, read in memory and
-    never unpacked. The sandbox chose what's in it, so members, sizes and bytes read
-    are capped, and anything that isn't a readable transcript is reported."""
+    never unpacked. The sandbox chose what's in it, so the decompressed stream,
+    each read, members, sizes and transcript bytes are capped, tarfile is never
+    asked to load the whole member list, and anything that isn't a readable
+    transcript is reported."""
     budget = {"left": MAX_ARCHIVE_BYTES}
     found = 0
+    regular = {}   # name -> member, for hard links, which point back at an earlier file
     try:
-        with tarfile.open(path, "r:*") as tar:
-            for count, member in enumerate(tar, 1):
+        with open(path, "rb") as raw:
+            gz = raw.read(2) == b"\x1f\x8b"
+            raw.seek(0)
+            stream = BoundedStream(gzip.GzipFile(fileobj=raw, mode="rb") if gz else raw)
+            tar = stream.headers(lambda: tarfile.open(fileobj=stream, mode="r:"))
+            count = 0
+            while True:
+                member = stream.headers(tar.next)
+                if member is None:
+                    break
+                tar.members.clear()   # tarfile keeps every member it reads; these are kept here
+                count += 1
                 if count > MAX_MEMBERS:
                     yield path, finding("unreadable-archive", "archive", f"more than {MAX_MEMBERS} members; stopped")
                     return
+                if member.isfile() and len(member.name) <= MAX_NAME:
+                    member.pax_headers = {}
+                    regular[posixpath.normpath(member.name)] = member
                 if not member.name.endswith(".jsonl"):
                     continue
                 found += 1
                 label = f"{path}:{member.name}"
-                if not (member.isfile() or member.islnk()):
+                data = member
+                if member.islnk():   # read the file it links to
+                    data = regular.get(posixpath.normpath(member.linkname))
+                    if data is None:
+                        yield label, finding("unreadable-line", "member", "a hard link to no file before it")
+                        continue
+                elif not member.isfile():
                     yield label, finding("unreadable-line", "member", "not a regular file (a link or device)")
                     continue
-                if member.size > MAX_MEMBER:
-                    yield label, finding("unreadable-line", "member", f"{member.size} bytes, over the cap")
+                if data.size > MAX_MEMBER:
+                    yield label, finding("unreadable-line", "member", f"{data.size} bytes, over the cap")
                     continue
-                f = tar.extractfile(member)   # resolves a hard link to its target's data
-                if f is None:
-                    yield label, finding("unreadable-line", "member", "no data")
-                    continue
-                yield label, scan_lines(read_lines(f, budget=budget))
-                if budget["left"] < 0:
+                yield label, scan_lines(read_lines(tar.extractfile(data), budget=budget))
+                if budget.get("stopped"):
                     return
+    except StreamCap as e:
+        yield path, finding("unreadable-archive", "archive", f"{e}; stopped")
+        return
     except Exception as e:  # zlib, tar header and other errors in data the sandbox wrote
         yield path, finding("unreadable-archive", "archive", f"{type(e).__name__}: {e}")
         return
