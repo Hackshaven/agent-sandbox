@@ -129,14 +129,17 @@ delivered() {   # delivered NS HOST PORT: send one datagram; succeeds if the sin
 }
 
 injected() {   # the sandbox, spoofing 192.0.2.2:5300, answers a flow the gateway opened
-  local port=$((40000 + RANDOM % 20000)) rc
+  local port=$((40000 + RANDOM % 20000)) rc ready="$TMP/injected-ready"
+  rm -f "$ready"
   S ip addr add 192.0.2.2/32 dev lo   # root on the sandbox can claim any source
   G python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.1", int(sys.argv[1])))
-s.connect(("192.0.2.2", 5300)); s.send(b"query"); s.settimeout(2)
-assert s.recv(64) == b"spoofed"' "$port" 2>/dev/null & local waiter=$!
-  sleep 0.5
+s.connect(("192.0.2.2", 5300)); s.send(b"query"); s.settimeout(3)
+open(sys.argv[2], "w").close()          # the flow exists now
+assert s.recv(64) == b"spoofed"' "$port" "$ready" 2>/dev/null & local waiter=$!
+  for _ in $(seq 1 50); do [[ -e "$ready" ]] && break; sleep 0.1; done
+  [[ -e "$ready" ]] || { wait "$waiter"; S ip addr del 192.0.2.2/32 dev lo; return 2; }
   S python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", 5300))
@@ -144,6 +147,12 @@ s.sendto(b"spoofed", ("192.0.2.1", int(sys.argv[1])))' "$port" 2>/dev/null
   wait "$waiter"; rc=$?
   S ip addr del 192.0.2.2/32 dev lo
   return "$rc"
+}
+refused() {   # refused "description" command...: passes only on a real refusal (exit 1);
+              # exit 2 means the probe couldn't run, which proves nothing
+  local what="$1" rc; shift
+  "$@"; rc=$?
+  if (( rc == 1 )); then ok "$what"; else bad "$what (exit $rc)"; fi
 }
 route_out()   { S ip route replace default via 10.77.0.1; }   # what an agent with root would add
 no_route_out() { S ip route del default via 10.77.0.1 2>/dev/null; true; }
@@ -197,7 +206,7 @@ refuse "gateway can't open other sandbox ports (:80)" tcp "$GW" 10.77.0.10 80
 route_out
 refuse "with a route, the gateway's internet-side address stays closed" tcp "$SBX" 192.0.2.1 443
 refuse "with a route, the proxy port stays closed on the gateway's other address" tcp "$SBX" 192.0.2.1 8080
-refuse "a spoofed reply from the lab can't reach a flow the gateway opened" injected
+refused "a spoofed reply from the lab can't reach a flow the gateway opened" injected
 
 # If forwarding were ever turned on, the rules still hold in both directions.
 # Outbound, prerouting and the forward chain both drop forwarded traffic, so these
@@ -209,7 +218,7 @@ refuse "with forwarding on, an internet host stays unreachable" tcp "$SBX" 192.0
 refuse "with forwarding on, an internet resolver stays unreachable" udp "$SBX" 192.0.2.2 53
 # One way, so the sandbox's reply (which prerouting drops) plays no part: only
 # the forward chain stands between this datagram and the sandbox.
-refuse "with forwarding on, the forward chain stops a datagram from the internet" delivered "$NET" 10.77.0.10 9999
+refused "with forwarding on, the forward chain stops a datagram from the internet" delivered "$NET" 10.77.0.10 9999
 forwarding 0
 no_route_out
 
