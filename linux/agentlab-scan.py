@@ -29,8 +29,12 @@ RULES = [
     ("ssh-or-file-transfer", "cmd", r"\b(ssh|scp|sftp|rsync)\b"),
     ("other-process-memory", "cmd", r"/proc/(\d+|self|\*|\$\w+)/(environ|mem|maps)\b"),
     ("cloud-metadata", "cmd", r"169\.254\.169\.254|metadata\.google\.internal|fd00:ec2::254"),
+    # Any URL whose host is a dotted name ending in letters. Loopback addresses
+    # (localhost, 127.0.0.1, [::1]) never match, since none ends that way. There is
+    # deliberately no exception list: the agent writes the URL, so a prefix
+    # exception such as "127." also passes 127.0.0.1.nip.io.
     ("outbound-url", "cmd",
-     r"(?i)\b(https?|ftp|wss?)://(?!localhost\b|127\.|0\.0\.0\.0|\[::1\])([a-z0-9-]+\.)+[a-z]{2,}\b"),
+     r"(?i)\b(https?|ftp|wss?)://([a-z0-9-]+\.)+[a-z]{2,}\b"),
     ("outbound-ip", "cmd",
      r"\b(?!(127|0|10)\.|172\.(1[6-9]|2\d|3[01])\.)(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"),
     ("package-install", "cmd",

