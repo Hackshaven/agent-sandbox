@@ -36,7 +36,7 @@ import sys
 
 DEFAULT_DENY = (r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|"
                 r"auto[- ]mode (has )?(denied|blocked)|"
-                r"permission to use \S+ (has been|was) denied|"
+                r"permission to use \S{1,64} (has been|was) denied|"
                 r"denied by (the )?(claude code )?(auto[- ]mode|permission) classifier)")
 DEFAULT_UNAVAILABLE = r"(?i)temporarily unavailable, so auto mode cannot determine"
 
@@ -141,16 +141,15 @@ def main():
                 return 7
             state["saw_init"] = True
             mode = msg.get("permissionMode")
+            rc = 6 if mode is None else 3 if mode != "auto" else None   # decide before printing
+            state["confirmed"] = rc is None
             show(f"[init] model={msg.get('model', '?')} permissionMode={mode or '?'} "
                  f"cwd={msg.get('cwd', '?')}")
-            if mode is None:
+            if rc == 6:
                 show("  ! STOP: init message has no permissionMode field, so auto mode can't be confirmed")
-                return 6
-            if mode != "auto":
+            elif rc == 3:
                 show(f"  ! STOP: permission mode is '{mode}', not 'auto'")
-                return 3
-            state["confirmed"] = True
-            return None
+            return rc
 
         # Prompts in a session transcript record the mode they were sent in.
         if mtype == "user" and "permissionMode" in msg:
@@ -180,20 +179,20 @@ def main():
                         show(f"[{turn:>3}] says: {short(text, 160)}")
 
         elif mtype == "user":
-            blocked = msg.get("toolDenialKind") == "automode-blocked"
+            marked = classifier_denied(msg)   # the record's own fields win over its text
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
                 text = text_of(block.get("content"))
                 is_error = bool(block.get("is_error"))
-                if is_error and blocked:
+                if is_error and marked:
                     denied = True
                 elif unavail_re.search(text):
                     state["unavailable"] += 1
                     show(f"      ~ classifier unavailable ({state['unavailable']})")
                     continue
                 else:
-                    denied = is_error and (classifier_denied(msg) or bool(deny_re.search(text)))
+                    denied = is_error and bool(deny_re.search(text))
                 if denied:
                     state["denials"] += 1
                     state["consecutive"] += 1

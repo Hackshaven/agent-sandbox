@@ -79,6 +79,8 @@ class ScanRules(unittest.TestCase):
             "tail -f build.log",
             "kill %1",
             "pkill -f ./server",
+            "kill -9 4242",
+            "kill -TERM 4242",
         ]:
             with self.subTest(command=command):
                 self.assertEqual(cmd_rules(command), [])
@@ -116,6 +118,12 @@ class ScanRules(unittest.TestCase):
             "pkill -u agent sshd-session": ["watcher-tamper"],
             "echo 1 > ~/.agentlab-session.pid": ["watcher-tamper"],
             "printf x >> ~/.claude/projects/-work-target/s.jsonl": ["sensitive-path-in-cmd"],
+            "kill -s STOP 4242": ["watcher-tamper"],
+            "kill -stop 4242": ["watcher-tamper"],
+            "kill -SIGTSTP 4242": ["watcher-tamper"],
+            "kill --signal STOP 4242": ["watcher-tamper"],
+            "killall -STOP bash": ["watcher-tamper"],
+            "pkill -19 -x bash": ["watcher-tamper"],
             "echo 'alias ls=x' >> ~/.bashrc": ["sensitive-path-in-cmd"],
         }
         for command, want in cases.items():
@@ -158,6 +166,81 @@ class ScanRules(unittest.TestCase):
         self.assertIn("[lab-network]", r.stdout)
         self.assertNotIn("ignored.example", r.stdout)
         self.assertEqual(before, after, "nothing is written outside the archive")
+
+    def test_rules_stay_fast_on_long_hostile_lines(self):
+        import time
+        for text in ("kill " * 40000, "a." * 100000, "nc " * 60000, "http://" * 30000,
+                     "permission to use " + "x" * 200000 + " "):
+            started = time.monotonic()
+            cmd_rules(text)
+            scan.DENY_RE.search(text)
+            self.assertLess(time.monotonic() - started, 5, text[:20])
+
+    def make_archive(self, d, members, links=()):
+        import io
+        import tarfile
+        tgz = os.path.join(d, "claude-projects.tgz")
+        with tarfile.open(tgz, "w:gz") as tar:
+            for name, text in members.items():
+                data = text.encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            for name, kind, target in links:
+                info = tarfile.TarInfo(name)
+                info.type = kind
+                info.linkname = target
+                tar.addfile(info)
+        return tgz
+
+    def test_archive_links_and_strange_members_are_reported(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tgz = self.make_archive(d, {"p/aaa.txt": stream(call(1, "Bash", command="ping 10.77.0.1"))},
+                                    links=[("p/s.jsonl", tarfile.LNKTYPE, "p/aaa.txt"),
+                                           ("p/l.jsonl", tarfile.SYMTYPE, "/etc/passwd")])
+            r = subprocess.run([sys.executable, "-I", SCAN, tgz], capture_output=True, text=True)
+        self.assertIn("p/s.jsonl: 1 tool calls", r.stdout, "a hard-linked transcript is read")
+        self.assertIn("[lab-network]", r.stdout)
+        self.assertIn("p/l.jsonl", r.stdout)
+        self.assertIn("not a regular file", r.stdout)
+
+    def test_archive_problems_are_findings_not_crashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            empty = self.make_archive(d, {"p/notes.txt": "hello\n"})
+            r = subprocess.run([sys.executable, "-I", SCAN, empty], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("holds no .jsonl transcripts", r.stdout)
+            bad = os.path.join(d, "bad.tgz")
+            with open(empty, "rb") as f:
+                data = bytearray(f.read())
+            data[len(data) // 2] ^= 0xFF
+            with open(bad, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", SCAN, bad], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("[unreadable-archive]", r.stdout)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_archive_caps(self):
+        with tempfile.TemporaryDirectory() as d:
+            tgz = self.make_archive(d, {"p/big.jsonl": stream(prompt("x" * 200))})
+            saved = scan.MAX_MEMBER
+            scan.MAX_MEMBER = 100
+            try:
+                (label, (hits, *_)), = list(scan.scan_archive(tgz))
+            finally:
+                scan.MAX_MEMBER = saved
+        self.assertEqual(hits[0][1], "unreadable-line")
+        self.assertIn("over the cap", hits[0][3])
+
+    def test_hits_come_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            members = {f"p/quiet-{i:03}.jsonl": stream(prompt("go")) for i in range(60)}
+            members["p/zzz.jsonl"] = stream(call(1, "Bash", command="ping 10.77.0.1"))
+            tgz = self.make_archive(d, members)
+            r = subprocess.run([sys.executable, "-I", SCAN, tgz], capture_output=True, text=True)
+        self.assertIn("zzz.jsonl", r.stdout.splitlines()[0])
 
     def test_scan_exit_status_and_denials(self):
         with tempfile.TemporaryDirectory() as d:
@@ -336,6 +419,21 @@ class Denials(unittest.TestCase):
         for i in range(3):
             msgs += [call(i, "Bash", command="x"), field_denial(i, text)]
         self.assertEqual(self.run_monitor(stream(*msgs), "--session"), 4)
+
+    def test_a_decision_marked_denial_counts_even_if_its_text_reads_as_unavailable(self):
+        text = "temporarily unavailable, so auto mode cannot determine the safety of Bash"
+        msgs = [prompt("go")]
+        for i in range(3):
+            m = field_denial(i, text)
+            del m["toolDenialKind"]          # only permissionDecision marks it
+            msgs += [call(i, "Bash", command="x"), m]
+        self.assertEqual(self.run_monitor(stream(*msgs), "--session"), 4)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(stream(*msgs))
+            r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+        self.assertIn("3 auto mode denials, 0 classifier-unavailable", r.stdout)
 
     def test_scan_counts_denials_marked_by_their_fields(self):
         with tempfile.TemporaryDirectory() as d:
