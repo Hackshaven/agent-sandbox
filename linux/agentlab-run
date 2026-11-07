@@ -99,7 +99,7 @@ exit 0
 REMOTE
 )" || die "sandbox preflight could not run"
 if [[ -n "$problems" ]]; then
-  printf '%s\n' "$problems" | sed 's/^/    FAIL  /'
+  printf '%s\n' "$problems" | cat -v | sed 's/^/    FAIL  /'   # cat -v: the text came from the sandbox
   die "sandbox preflight failed"
 fi
 note "sandbox looks contained"

@@ -42,6 +42,25 @@ def text_of(content):
     return ""
 
 
+def printable(s):
+    """Escape what a terminal could act on before it reaches one.
+
+    The agent writes most of what gets printed here, and a terminal treats some
+    characters as commands: ESC sequences can clear lines, move the cursor, set
+    the title, or (in some terminals) write the clipboard. Control characters,
+    C1 controls, bidi overrides and other non-printing characters come out as
+    \\xNN, \\uNNNN or \\UNNNNNNNN instead.
+    """
+    out = []
+    for c in str(s):
+        if c.isprintable():
+            out.append(c)
+        else:
+            o = ord(c)
+            out.append(f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}")
+    return "".join(out)
+
+
 def short(s, n):
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -76,7 +95,7 @@ def main():
 
     def show(msg):
         if not args.quiet:
-            print(msg, flush=True)
+            print(printable(msg), flush=True)
 
     with open(args.out, "a", encoding="utf-8") as out:
         for raw in sys.stdin:

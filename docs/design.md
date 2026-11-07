@@ -32,7 +32,7 @@ Docker still has a job: rootless Docker runs local targets *inside* the sandbox 
 | No cloud metadata reachable | Not on a cloud host; the gateway refuses to route | `gateway-setup.sh` |
 | Turn and time limit on every run | `--max-turns` and `timeout`, validated before launch; unreadable limits refuse to start, and so does a zero time limit, which `timeout` reads as none | `agentlab-run`, `agentlab.ps1 run` |
 | No privileged mode or added capabilities | Agent has no sudo and isn't in `docker`, `adm` or `lxd`; Docker is rootless | `sandbox-setup.sh install` |
-| Orchestrator and transcripts on the trusted side | Runs launch from the gateway; transcripts and logs are written there | `agentlab-run` |
+| Orchestrator and transcripts on the trusted side | Runs launch from the gateway; transcripts and logs are written there. Agent text the monitor, the scan and the launcher print on the gateway has control characters escaped, so it can't drive the operator's terminal | `agentlab-run`, `agentlab-monitor.py`, `agentlab-scan.py` |
 | Auto mode as defense in depth, never `bypassPermissions` | Managed settings set `defaultMode: auto` and disable bypass; environment and tampering rules describe the lab; the No-network rule is added only after checks pass | `sandbox-setup.sh install`, `finalize` |
 | Setup phase, then attack phase | Tools installed with internet in `install`; `cutover` is permanent; changes go through `reopen` and a re-check | `sandbox-setup.sh` |
 | Test the sandbox before relying on it | Config checks, hand checks and a supervised escape test, repeated after any sandbox or model change | `agentlab-check.sh`, `templates/escape-test.md` |
@@ -53,6 +53,7 @@ proxy log line.
 | Sandbox escape classifier score | Not available to agents in Claude Code | Transcript and log review |
 | Proxy forwards model calls only | The path allowlist is a starting guess | Tune it from 403 lines after the first real run |
 | Treat auto mode rules as security config | Root-owned managed settings; the agent isn't root | Recheck `claude auto-mode config` after every Claude Code update |
+| Orchestrator on the trusted side | An interactive run puts the agent's terminal on yours, escape sequences included; nothing filters a live session | Prefer headless runs for anything long or unwatched |
 
 Whatever the agent sends to the model, including target code and findings, leaves
 the network in request bodies the proxy doesn't log.

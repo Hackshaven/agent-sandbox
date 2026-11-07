@@ -175,5 +175,48 @@ class Monitor(unittest.TestCase):
         self.assertEqual(rc, 5)
 
 
+
+# Window title (OSC 0, ended by BEL), clear screen, cursor up, a C1 control
+# sequence introducer, and a right-to-left override.
+ESCAPES = "\x1b]0;owned\x07\x1b[2J\x1b[1A\x9b2K\u202e"
+
+
+class TerminalOutput(unittest.TestCase):
+    """Text the agent wrote reaches the operator's terminal escaped."""
+
+    def assert_inert(self, text):
+        for ch in ("\x1b", "\x07", "\x9b", "\u202e", "\ud800"):
+            self.assertNotIn(ch, text)
+        self.assertIn("\\x1b", text)
+
+    def test_monitor_escapes_agent_text(self):
+        msgs = [dict(init(), cwd="/work" + ESCAPES),
+                call(1, "Bash" + ESCAPES, command="echo " + ESCAPES),
+                result(1, "boom " + ESCAPES, error=True),
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "lone surrogate \ud800 " + ESCAPES}]}}]
+        raw = stream(*msgs) + "not json " + ESCAPES + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.jsonl")
+            r = subprocess.run([sys.executable, "-I", MONITOR, "--out", out],
+                               input=raw, capture_output=True, text=True)
+            with open(out) as f:
+                written = f.read()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_inert(r.stdout)
+        self.assertEqual(written, raw, "the evidence copy must stay byte for byte")
+
+    def test_scan_escapes_agent_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(stream(init(), call(1, "Bash" + ESCAPES,
+                                            command="curl https://example.com/" + ESCAPES)))
+            r = subprocess.run([sys.executable, "-I", SCAN, path], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("[outbound-url]", r.stdout)
+        self.assert_inert(r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

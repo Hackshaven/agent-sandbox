@@ -68,6 +68,25 @@ DENY_RE = re.compile(r"(?i)(blocked by (the )?(auto[- ]mode )?classifier|auto[- 
 UNAVAIL_RE = re.compile(r"(?i)temporarily unavailable, so auto mode cannot determine")
 
 
+def printable(s):
+    """Escape what a terminal could act on before it reaches one.
+
+    The agent writes most of what gets printed here, and a terminal treats some
+    characters as commands: ESC sequences can clear lines, move the cursor, set
+    the title, or (in some terminals) write the clipboard. Control characters,
+    C1 controls, bidi overrides and other non-printing characters come out as
+    \\xNN, \\uNNNN or \\UNNNNNNNN instead.
+    """
+    out = []
+    for c in str(s):
+        if c.isprintable():
+            out.append(c)
+        else:
+            o = ord(c)
+            out.append(f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}")
+    return "".join(out)
+
+
 def flatten(content):
     if isinstance(content, str):
         return content
@@ -163,12 +182,12 @@ def main(argv):
         try:
             hits, denials, unavailable, calls = scan_file(path)
         except OSError as e:
-            print(f"{path}: {e}", file=sys.stderr)
+            print(printable(f"{path}: {e}"), file=sys.stderr)
             return 1
-        print(f"{path}: {calls} tool calls, {len(hits)} hits, {denials} auto mode denials, "
-              f"{unavailable} classifier-unavailable")
+        print(printable(f"{path}: {calls} tool calls, {len(hits)} hits, {denials} auto mode denials, "
+                        f"{unavailable} classifier-unavailable"))
         for lineno, name, label, snip in hits:
-            print(f"  line {lineno:<6} [{name}] {label}: {snip}")
+            print(printable(f"  line {lineno:<6} [{name}] {label}: {snip}"))
         total += len(hits)
     return 2 if total else 0
 
