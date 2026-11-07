@@ -38,8 +38,11 @@ done
 say()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf 'REFUSED: %s\n' "$*" >&2; exit 1; }
-# The sandbox writes what comes back on stderr, so show it through cat -v.
-sbx()  { ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@" 2> >(cat -v >&2); }
+# The sandbox writes what comes back on stderr, so show it through cat -v. Every
+# command runs through the agent's own shell, which the agent can stall, so each
+# call has a time bound: sbx SECONDS COMMAND...
+# --foreground keeps ssh in the terminal's process group, as it was before the bound.
+sbx()  { local t="$1"; shift; timeout --foreground -k 5 "$t" ssh "${SSH_OPTS[@]}" "agent@$SBX" "$@" 2> >(cat -v >&2); }
 
 # ------------------------------------------------------------ validate limits
 # Refuse to launch on any limit that can't be read, rather than running uncapped.
@@ -77,14 +80,14 @@ note "firewall, proxy and logs look right"
 # ------------------------------------------------------------ wait for sandbox
 say "Waiting for the sandbox at $SBX (up to ${WAIT}s)"
 deadline=$((SECONDS + WAIT))
-until sbx true 2>/dev/null; do
+until sbx 15 true < /dev/null > /dev/null 2>&1; do
   (( SECONDS < deadline )) || die "sandbox not reachable over SSH. Is it started and cut over?"
   sleep 3
 done
 
 say "Sandbox preflight"
 # Runs as agent on the sandbox. Prints one line per failure.
-problems="$(sbx 'bash -s' <<'REMOTE'
+problems="$(sbx 60 'bash -s' <<'REMOTE'
 set -u
 # As strict as agentlab-check: the lab route present (so an empty read fails), no
 # route beyond the lab in any routing table, no IPv6 address at all, one network
@@ -140,19 +143,22 @@ off_deny=$(stat -c %s "$LOG_DIR/egress-deny.log" 2>/dev/null || echo 0)
 
 # ------------------------------------------------------------ deliver inputs
 say "Delivering inputs"
-sbx 'rm -f "$HOME/.agentlab-session.pid"; rm -rf /work/target /work/inbox && mkdir -p /work/target /work/inbox && cat > /work/inbox/task.md' < "$TASK"
+sbx 120 'rm -f "$HOME/.agentlab-session.pid"; rm -rf /work/target /work/inbox && mkdir -p /work/target /work/inbox && cat > /work/inbox/task.md' < "$TASK" > /dev/null
 if [[ -n "$TARGET" ]]; then
-  tar -C "$TARGET" -cf - . | sbx 'tar -C /work/target -xf -'
+  tar -C "$TARGET" -cf - . | sbx 1800 'tar -C /work/target -xf -' > /dev/null
   echo "target_sha256=$(tar -C "$TARGET" --sort=name --mtime=@0 --owner=0 --group=0 -cf - . | sha256sum | cut -d' ' -f1)" >> "$RUN_DIR/meta.txt"
 fi
 
 stop_remote() {
-  sbx 'pkill -TERM -u agent -f "claude( |$)" ; sleep 2; pkill -KILL -u agent -f "claude( |$)"; exit 0' 2>/dev/null || true
+  sbx 20 'pkill -TERM -u agent -f "claude( |$)" ; sleep 2; pkill -KILL -u agent -f "claude( |$)"; exit 0' \
+    < /dev/null > /dev/null 2>&1 || true
 }
 collect() {
   set +e
   say "Collecting evidence into $RUN_DIR"
-  sbx 'cd "$HOME" && [ -d .claude ] && tar -czf - .claude/projects 2>/dev/null' > "$RUN_DIR/claude-projects.tgz" 2>/dev/null
+  sbx 600 'cd "$HOME" && [ -d .claude ] && tar -czf - .claude/projects 2>/dev/null' < /dev/null 2>/dev/null \
+    | head -c 2147483648 > "$RUN_DIR/claude-projects.tgz"   # 2 GiB: the agent decides what's in it
+  echo "projects_tgz_exit=${PIPESTATUS[0]} bytes=$(stat -c %s "$RUN_DIR/claude-projects.tgz")" >> "$RUN_DIR/meta.txt"
   [[ -s "$RUN_DIR/claude-projects.tgz" ]] || rm -f "$RUN_DIR/claude-projects.tgz"
   for pair in "credproxy:$off_proxy" "egress-deny:$off_deny"; do
     name="${pair%%:*}" off="${pair##*:}" f="$LOG_DIR/${pair%%:*}.log"
@@ -163,49 +169,61 @@ collect() {
   done
   echo "ended=$(date -Is)" >> "$RUN_DIR/meta.txt"
 }
-# Interactive runs: a watcher follows the transcript Claude Code writes on the
+# Interactive runs: a watcher follows the transcripts Claude Code writes on the
 # sandbox, through agentlab-monitor, and ends the session if it leaves auto mode,
 # spends the denial budget, or writes a line the monitor won't trust. The session
-# writes its own PID to ~/.agentlab-session.pid (cleared at delivery), and the
-# remote side follows the newest transcript written since it started, switching
-# when a newer one appears (/clear starts one). It exits, and so ends the gateway's
-# view, if no transcript appears within five minutes, or if its tail dies, is
-# stopped, or has its file swapped while the session runs. Everything on that side runs as agent, so the gateway treats any early end
-# of the watcher as a lost watcher and ends the session itself: a tripwire that
-# fails closed, not a control the agent can't touch.
-WATCH_REMOTE='t0="$(date +%s)"; pidfile="$HOME/.agentlab-session.pid"; p=""; f=""; t=""; ino=""; idle=0
+# writes its own PID to ~/.agentlab-session.pid (cleared at delivery). The remote
+# side starts one tail on each transcript written since it started (/clear starts
+# a new one) and never stops one while its file lives, so a file the agent adds
+# can add lines but can't hide any. It exits, and so ends the gateway's view, if
+# no transcript appears within five minutes, or if a tail dies, is stopped, or has
+# its file deleted or swapped while the session runs. POSIX sh, one line per tail.
+# Everything on that side runs as agent, so the gateway treats any early end of
+# the watcher as a lost watcher and ends the session itself: a tripwire that fails
+# closed, not a control the agent can't touch.
+WATCH_REMOTE='t0="$(date +%s)"; pidfile="$HOME/.agentlab-session.pid"; p=""; known=""; idle=0
+nl="
+"
 for _ in $(seq 1 60); do [ -s "$pidfile" ] && p="$(cat "$pidfile")" && break; sleep 1; done
 case "$p" in ""|*[!0-9]*) exit 2 ;; esac
-newest() {
-  find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -name "*.jsonl" -newermt "@$t0" \
-    -printf "%T@ %p\n" 2>/dev/null | sort -n | tail -1 | cut -d" " -f2-
-}
+IFS="$nl"
 while kill -0 "$p" 2>/dev/null; do
-  n="$(newest)"
-  if [ -n "$n" ] && [ "$n" != "$f" ]; then
-    [ -n "$t" ] && kill "$t" 2>/dev/null
-    f="$n"; ino="$(stat -c %i "$f")"
-    tail --pid="$p" -n +1 -F "$f" 2>/dev/null & t=$!
-  fi
-  if [ -z "$f" ]; then idle=$((idle + 1)); [ "$idle" -ge 300 ] && exit 6; fi
-  if [ -n "$t" ]; then
-    if ! kill -0 "$t" 2>/dev/null; then kill -0 "$p" 2>/dev/null && exit 3; break; fi
-    case "$(ps -o stat= -p "$t" 2>/dev/null)" in T*) kill -KILL "$t"; exit 4 ;; esac
-    [ "$(stat -c %i "$f" 2>/dev/null)" = "$ino" ] || { kill -KILL "$t"; exit 5; }
+  for f in $(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -name "*.jsonl" -newermt "@$t0" 2>/dev/null); do
+    case "$known" in *"|$f|"*) continue ;; esac
+    tail --pid="$p" -n +1 -F "$f" 2>/dev/null &
+    known="$known$!|$f|$(stat -c %i "$f")$nl"
+    echo "following $f" >&2
+  done
+  if [ -z "$known" ]; then idle=$((idle + 1)); [ "$idle" -ge 300 ] && exit 6; fi
+  printf %s "$known" | {
+    rc=0
+    while IFS="|" read -r t f ino; do
+      if ! kill -0 "$t" 2>/dev/null; then kill -0 "$p" 2>/dev/null && rc=3; break; fi
+      case "$(ps -o stat= -p "$t" 2>/dev/null)" in T*) rc=4; break ;; esac
+      [ "$(stat -c %i "$f" 2>/dev/null)" = "$ino" ] || { rc=5; break; }
+    done
+    exit "$rc"
+  }
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    printf %s "$known" | while IFS="|" read -r t _; do kill -KILL "$t" 2>/dev/null; done
+    exit "$rc"
   fi
   sleep 1
 done
-[ -n "$t" ] && wait "$t"
+wait
 exit 0'
 SESSION_FLAG="$RUN_DIR/.session-running"
 watch_pid=""
 end_session() {   # end_session REASON: stop the interactive session from the gateway side
   echo "watch_stop=$1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
-  stop_remote
-  for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || return 0; sleep 1; done
-  # stop_remote runs as agent on the sandbox, so don't rely on it: end the local
-  # ssh -t too. The run then finishes, and agentlab.ps1 reverts the VM.
-  pkill -TERM -u "$(id -u)" -f -- "-t agent@${SBX//./\\.} .*\\.agentlab-session\\.pid" 2>/dev/null || true
+  stop_remote & local sr=$!
+  for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || break; sleep 1; done
+  # stop_remote runs through the agent's own shell, so don't wait on it: end the
+  # local ssh -t too. The run then finishes, and agentlab.ps1 reverts the VM.
+  [[ -e "$SESSION_FLAG" ]] && { pkill -TERM -u "$(id -u)" -f -- \
+    "-t agent@${SBX//./\\.} .*\\.agentlab-session\\.pid" 2>/dev/null || true; }
+  wait "$sr" 2>/dev/null || true
 }
 watch_session() {   # runs in the background for the length of an interactive session
   set +e
@@ -213,19 +231,20 @@ watch_session() {   # runs in the background for the length of an interactive se
   # A process substitution, so the monitor's exit acts at once rather than when
   # ssh next writes. The feed records its ssh's PID, which $! can't give here.
   agentlab-monitor --session --quiet --log "$RUN_DIR/session-monitor.log" \
-    --out "$RUN_DIR/session-transcript.jsonl" \
-    < <(ssh "${SSH_OPTS[@]}" "agent@$SBX" "$WATCH_REMOTE" < /dev/null 2>>"$RUN_DIR/watch.log" &
+    --out "$RUN_DIR/session-transcript.jsonl" 2>>"$RUN_DIR/session-monitor.log" \
+    < <(ssh "${SSH_OPTS[@]}" "agent@$SBX" "$WATCH_REMOTE" < /dev/null \
+          2> >(head -c 1048576 >> "$RUN_DIR/watch.log") &
         echo "$!" > "$feed"; wait "$!"
         echo "watch_remote_exit=$? at=$(date -Is)" >> "$RUN_DIR/meta.txt")
   mrc=$?
   echo "watch_exit=$mrc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
   case $mrc in
-    3|4|7) end_session "the monitor stopped it (exit $mrc)" ;;
+    3|4|7) end_session "the monitor stopped it (exit $mrc)"
+           [[ -s "$feed" ]] && kill "$(cat "$feed")" 2>/dev/null ;;
     *) # The watcher stopped reading. If the session is still up, nothing is watching it.
        for _ in 1 2 3 4 5; do [[ -e "$SESSION_FLAG" ]] || break; sleep 1; done
        [[ -e "$SESSION_FLAG" ]] && end_session "the watcher ended (exit $mrc) while the session ran" ;;
   esac
-  [[ -s "$feed" ]] && kill "$(cat "$feed")" 2>/dev/null
   rm -f "$feed"
   return 0
 }
@@ -235,8 +254,13 @@ stop_watch() {   # let the watcher finish once the session has ended, then make 
   pkill -TERM -P "$watch_pid" 2>/dev/null || true
   wait "$watch_pid" 2>/dev/null || true
 }
-trap 'echo; note "Interrupted: stopping the agent"; echo "interrupted=yes at=$(date -Is)" >> "$RUN_DIR/meta.txt"
-      rm -f "$SESSION_FLAG"; stop_remote; stop_watch; collect; exit 130' INT TERM
+on_signal() {   # on_signal NAME CODE: stop the agent and keep the evidence
+  [[ $1 == HUP ]] && exec > /dev/null 2>&1   # the operator's terminal is gone
+  echo; note "Interrupted ($1): stopping the agent"
+  echo "interrupted=$1 at=$(date -Is)" >> "$RUN_DIR/meta.txt"
+  rm -f "$SESSION_FLAG"; stop_remote; stop_watch; collect; exit "$2"
+}
+trap 'on_signal INT 130' INT; trap 'on_signal TERM 143' TERM; trap 'on_signal HUP 129' HUP
 
 # ------------------------------------------------------------ launch
 REMOTE_ENV='set -a; . /etc/environment; set +a; cd /work/target'
@@ -249,7 +273,7 @@ if [[ $INTERACTIVE == 1 ]]; then
   : > "$SESSION_FLAG"
   watch_session & watch_pid=$!
   script -q -f -e "$RUN_DIR/session.log" -c \
-    "ssh ${SSH_OPTS[*]} -t agent@$SBX '$REMOTE_ENV; echo \$\$ >\"\$HOME/.agentlab-session.pid\"; exec timeout --foreground --kill-after=30s $TIME claude --model $MODEL --permission-mode auto'" || rc=$?
+    "timeout --foreground -k 30 $((time_s + 120)) ssh ${SSH_OPTS[*]} -t agent@$SBX '$REMOTE_ENV; echo \$\$ >\"\$HOME/.agentlab-session.pid\"; exec timeout --foreground --kill-after=30s $TIME claude --model $MODEL --permission-mode auto'" || rc=$?
   rm -f "$SESSION_FLAG"
   echo "session_exit=$rc at=$(date -Is)" >> "$RUN_DIR/meta.txt"
   [[ $rc == 124 || $rc == 137 ]] && note "Time limit reached; the run is final and won't be resumed."
@@ -257,7 +281,8 @@ else
   say "Headless run: $TURNS turns max, $TIME max, model $MODEL"
   note "Transcript: $RUN_DIR/transcript.jsonl"
   set +e
-  sbx "$REMOTE_ENV; exec timeout --kill-after=30s $TIME claude -p --model $MODEL --max-turns $TURNS --permission-mode auto --output-format stream-json --verbose < /work/inbox/task.md" \
+  # The remote timeout runs as the agent; sbx's bound is the gateway's own.
+  sbx "$((time_s + 120))" "$REMOTE_ENV; exec timeout --kill-after=30s $TIME claude -p --model $MODEL --max-turns $TURNS --permission-mode auto --output-format stream-json --verbose < /work/inbox/task.md" < /dev/null \
     | agentlab-monitor --out "$RUN_DIR/transcript.jsonl" --require-init
   codes=("${PIPESTATUS[@]}")
   set -e
@@ -274,7 +299,7 @@ else
   esac
   rc=$(( monitor_rc != 0 ? monitor_rc : remote_rc ))
 fi
-trap - INT TERM
+trap - INT TERM HUP
 stop_remote
 if [[ -n "$watch_pid" ]]; then
   stop_watch
@@ -315,9 +340,13 @@ for t in transcript.jsonl session-transcript.jsonl claude-projects.tgz; do
   [[ -s "$RUN_DIR/$t" ]] && transcripts+=("$RUN_DIR/$t")
 done
 if (( ${#transcripts[@]} )); then
-  agentlab-scan "${transcripts[@]}" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
+  timeout -k 10 600 agentlab-scan "${transcripts[@]}" > "$RUN_DIR/scan.txt" && scan_rc=0 || scan_rc=$?
   head -40 "$RUN_DIR/scan.txt" | sed 's/^/    /'
-  (( scan_rc == 2 )) && note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt"
+  case $scan_rc in
+    0) ;;
+    2) note "Scan hits are reasons to read those lines, not verdicts. Full list: $RUN_DIR/scan.txt" ;;
+    *) note "The scan didn't finish (exit $scan_rc), so read the transcripts by hand." ;;
+  esac
 fi
 note "Evidence: $RUN_DIR"
 exit "$rc"

@@ -134,8 +134,13 @@ Each run's folder on the gateway holds `task.md`, `meta.txt`, `transcript.jsonl`
 `watch.log` (interactive), `claude-projects.tgz`, `credproxy.new.log`,
 `egress-deny.new.log` and `scan.txt`. `meta.txt` records how the run ended:
 `remote_exit` and `monitor_exit` for a headless run; `session_exit`,
-`watch_exit`, `watch_remote_exit` and any `watch_stop` reason for an interactive
-one; `interrupted` after Ctrl+C.
+`watch_exit`, any `watch_stop` reason and, when the watcher's ssh has ended,
+`watch_remote_exit` for an interactive one; `interrupted` after Ctrl+C, a closed
+window or a TERM; and `projects_tgz_exit` for the evidence pull. The run's exit
+code says how it ended: 0 finished, 3 not in auto mode, 4 denial budget spent,
+5 no init message, 6 auto mode not confirmed, 7 a transcript line the monitor
+won't trust, 8 the watcher was lost, 124 or 137 the time limit, 129, 130 or 143
+interrupted.
 Folders older than 45 days are pruned. The files are kept byte for byte,
 including whatever the agent wrote, so read them with `less` (not `less -R`) or
 `cat -v`, never plain `cat` or `tail -f`, and don't paste into an admin console
@@ -246,7 +251,10 @@ steps 4, 6 and 7 and the escape test in step 8 are what verify a real build.
   `/clear` starts a new one, and that subagents write separate files below it.
   If yours differs, the watcher finds no transcript and ends the session five
   minutes after it starts, or follows the wrong file. Check one interactive
-  run after each Claude Code update.
+  run after each Claude Code update. A session with no first prompt within five
+  minutes is ended the same way, since its transcript doesn't exist yet.
+- The monitor stops a run on a transcript line over 16 MiB. A tool result that
+  carries a very large file (an image or PDF read whole) could reach that.
 - Unverified until your first run: that auto mode works with a custom
   `ANTHROPIC_BASE_URL` on your plan, which extra paths Claude Code requests, and
   that `/etc/claude-code/managed-settings.json` is read (the sandbox check tests

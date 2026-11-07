@@ -41,8 +41,10 @@ check "a missing task file is refused" refused_for "--task file not found" --tas
 # Whatever the sandbox writes on stderr reaches the operator's terminal through
 # sbx, so sbx must show it through cat -v.
 SBX_FN="$(grep -E '^sbx\(\) ' "$RUN")"
+mkdir -p "$TMP/fakessh"
+printf '#!/bin/sh\nprintf "\\033]0;owned\\007boom\\n" >&2\n' > "$TMP/fakessh/ssh"; chmod +x "$TMP/fakessh/ssh"
 # shellcheck disable=SC2034  # SSH_OPTS and SBX are read by the eval'd sbx
-stderr_seen="$(ssh() { printf '\033]0;owned\007boom\n' >&2; }; SSH_OPTS=(); SBX=x; eval "$SBX_FN"; sbx true 2>&1)"
+stderr_seen="$(PATH="$TMP/fakessh:$PATH"; SSH_OPTS=(); SBX=x; eval "$SBX_FN"; sbx 5 true 2>&1)"
 check "sbx shows the sandbox's stderr with control characters visible" \
   bash -c '[[ "$1" != *$'"'"'\e'"'"'* && "$1" == *"^["*boom* ]]' _ "$stderr_seen"
 
@@ -67,7 +69,7 @@ done
 refuse "the preflight accepts an agent in no privileged group" group_flagged "agent users sudoers dockerx"
 
 # The three places that list the privileged groups have to agree.
-words() { tr -c 'a-z\n' ' ' | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
+words() { tr -c 'a-z\n-' ' ' | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
 quoted_alternation() { grep -oE "grep -qwE '[a-z|-]+'" "$1" | head -1 | sed -E "s/.*'(.*)'/\1/" | words; }
 run_groups="$(quoted_alternation "$RUN")"
 check_groups="$(quoted_alternation "$REPO/linux/agentlab-check.sh")"
@@ -82,14 +84,20 @@ check "sandbox-setup removes the preflight's groups [$run_groups]" test "$setup_
 # stop_remote that (like a sandbox that won't listen) stops nothing, and a stand-in
 # for the operator's ssh -t session. A watcher that stops, or is lost while the
 # session runs, must end that session from the gateway.
-GATEWAY_WATCH="$(awk '/^SESSION_FLAG=/ { f = 1 } /^trap .*Interrupted/ { exit } f' "$RUN")"
+GATEWAY_WATCH="$(awk '/^SESSION_FLAG=/ { f = 1 } /^on_signal\(\)/ { exit } f' "$RUN")"
 check "the gateway watcher functions are found" grep -q '^end_session()' <<<"$GATEWAY_WATCH"
+# The stand-in session carries the command line agentlab-run launches, so the
+# pattern end_session kills by is checked against the real thing.
+LAUNCH_LINE="$(grep -oE '"timeout --foreground -k 30 .*permission-mode auto'"'"'"' "$RUN")"
+SESSION_CMD="$(bash -c 'SSH_OPTS=(-i key -o BatchMode=yes); SBX=10.77.0.10; REMOTE_ENV="cd /work/target"
+  time_s=60; TIME=1m; MODEL=claude-x; eval "cmd=$1"; printf %s "$cmd"' _ "$LAUNCH_LINE")"
+check "the interactive launch line is found" grep -q -- '-t agent@10.77.0.10 .*agentlab-session.pid' <<<"$SESSION_CMD"
 gateway_case() {   # gateway_case NAME: prints "<watch_exit> <ended|running> <stop reason or ->"
   local dir="$TMP/gw-$1" sess
   mkdir -p "$dir/bin"
   printf '#!/bin/sh\nexec python3 -I %s "$@"\n' "$REPO/linux/agentlab-monitor.py" > "$dir/bin/agentlab-monitor"
   chmod +x "$dir/bin/agentlab-monitor"
-  bash -c 'exec -a "ssh -t agent@10.77.0.10 x; echo \$\$ >\"\$HOME/.agentlab-session.pid\"; $1" sleep 60' _ "$1" &
+  bash -c 'exec -a "$1" sleep 60' _ "$SESSION_CMD" &
   sess=$!
   CASE="$1" SESS="$sess" RUN_DIR="$dir" PATH="$dir/bin:$PATH" GATEWAY_WATCH="$GATEWAY_WATCH" bash -c '
     SBX=10.77.0.10; SSH_OPTS=(); WATCH_REMOTE=unused
@@ -98,12 +106,12 @@ gateway_case() {   # gateway_case NAME: prints "<watch_exit> <ended|running> <st
     ssh() {   # the feed: what the sandbox side would send
       prompt auto
       case "$CASE" in
-        stops) prompt plan; sleep 30 ;;
+        stops|hang) prompt plan; sleep 30 ;;
         lost) ;;
         normal) while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done ;;
       esac
     }
-    stop_remote() { echo stop_remote >> "$RUN_DIR/calls"; }
+    stop_remote() { echo stop_remote >> "$RUN_DIR/calls"; [ "$CASE" = hang ] && sleep 30; true; }
     : > "$SESSION_FLAG"
     ( while kill -0 "$SESS" 2>/dev/null; do sleep 0.2; done; rm -f "$SESSION_FLAG" ) &
     watch_session & watch_pid=$!
@@ -113,17 +121,21 @@ gateway_case() {   # gateway_case NAME: prints "<watch_exit> <ended|running> <st
   local state=running
   kill -0 "$sess" 2>/dev/null || state=ended
   kill "$sess" 2>/dev/null; wait "$sess" 2>/dev/null
-  printf '%s %s %s\n' "$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$dir/meta.txt" | tail -1)" "$state" \
+  printf '%s %s %s %s\n' "$(sed -n 's/^watch_exit=\([0-9]*\).*/\1/p' "$dir/meta.txt" | tail -1)" "$state" \
+    "$(grep -c stop_remote "$dir/calls" 2>/dev/null || echo 0)" \
     "$(sed -n 's/^watch_stop=\(.*\) at=.*/\1/p' "$dir/meta.txt" | tail -1 | grep . || echo -)"
 }
 out="$(gateway_case stops)"
 check "gateway: a monitor stop ends the session even if the sandbox ignores it [$out]" \
-  grep -q '^3 ended the monitor stopped it' <<<"$out"
+  grep -q '^3 ended 1 the monitor stopped it' <<<"$out"
+out="$(gateway_case hang)"
+check "gateway: it ends the session even while stop_remote hangs [$out]" \
+  grep -q '^3 ended 1 the monitor stopped it' <<<"$out"
 out="$(gateway_case lost)"
 check "gateway: a watcher lost mid-session ends the session [$out]" \
-  grep -q '^0 ended the watcher ended (exit 0) while the session ran' <<<"$out"
+  grep -q '^0 ended 1 the watcher ended (exit 0) while the session ran' <<<"$out"
 out="$(gateway_case normal)"
-check "gateway: a session that ends by itself leaves no stop [$out]" test "$out" = "0 ended -"
+check "gateway: a session that ends by itself leaves no stop [$out]" test "$out" = "0 ended 0 -"
 
 if [[ $EUID -ne 0 ]]; then
   skip "not root: the session watcher and the preflight's route checks need namespaces (CI runs them with sudo)"
@@ -152,7 +164,7 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
         [ "$CASE" = stale ] && { prompt default > "$proj/old.jsonl"; sleep 1.1; }
         "$HOME/bin/claude" 120 & claude=$!
         echo "$claude" > "$HOME/.agentlab-session.pid"
-        { bash -c "$WATCH" | python3 -I "$MONITOR" --session --quiet --out "$HOME/out.jsonl"
+        { bash -c "$WATCH" 2>/dev/null | python3 -I "$MONITOR" --session --quiet --out "$HOME/out.jsonl"
           echo "${PIPESTATUS[1]}" > "$HOME/rc"; } &
         sleep 1.2                      # transcripts must be newer than the watcher
         prompt auto >> "$proj/new.jsonl"
@@ -163,6 +175,11 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
           init)   echo "{\"type\": \"system\", \"subtype\": \"init\"}" >> "$proj/new.jsonl" ;;
           kill)   pkill -x tail ;;
           swap)   mv "$proj/new.jsonl" "$proj/new.bak"; ln -s /dev/null "$proj/new.jsonl" ;;
+          delete) rm "$proj/new.jsonl" ;;
+          decoy)  mkdir -p "$HOME/.claude/projects/x"
+                  prompt auto > "$HOME/.claude/projects/x/d.jsonl"
+                  touch -d @4102444800 "$HOME/.claude/projects/x/d.jsonl"
+                  sleep 2.5; prompt acceptEdits >> "$proj/new.jsonl" ;;
           stop)   pkill -STOP -x tail ;;
         esac
         until_done 16 && when=early || when=held
@@ -175,7 +192,8 @@ if unshare --pid --fork --mount-proc true 2>/dev/null; then
   check "watcher: a transcript from before the session is ignored" test "$(watch_case stale)" = "0 held"
   check "watcher: it follows the new transcript /clear starts" test "$(watch_case clear)" = "3 early"
   check "watcher: an init record written into the transcript stops it" test "$(watch_case init)" = "7 early"
-  for c in kill swap stop; do
+  check "watcher: a decoy transcript can't hide the real one" test "$(watch_case decoy)" = "3 early"
+  for c in kill swap stop delete; do
     out="$(watch_case "$c")"
     check "watcher: tampering ($c) ends the watcher while the session runs [$out]" grep -q ' early$' <<<"$out"
   done
